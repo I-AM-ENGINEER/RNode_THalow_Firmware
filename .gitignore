@@ -1,0 +1,29 @@
+# ESP-IDF build output
+build/
+sdkconfig
+sdkconfig.old
+dependencies.lock
+
+# IDF Component Manager
+managed_components/
+
+# CMake / Ninja
+CMakeCache.txt
+CMakeFiles/
+
+# IDE
+.vscode/
+.idea/
+.cache/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Documentation (not presentable yet)
+docs/
+
+# OS
+.DS_Store
+Thumbs.db

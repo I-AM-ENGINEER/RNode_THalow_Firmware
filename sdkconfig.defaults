@@ -1,0 +1,29 @@
+#
+# sdkconfig.defaults — RNode-HaLow (ESP32-S3-WROOM-1 N16R8)
+#
+# Таргет задаётся через `idf.py set-target esp32s3`, здесь — только железо/сеть.
+# Полную конфигурацию правит `idf.py menuconfig` (результат идёт в sdkconfig).
+
+# --- Цель ---
+CONFIG_IDF_TARGET="esp32s3"
+
+# --- Flash: 16 МБ, Quad I/O, 80 МГц ---
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+
+# --- PSRAM: 8 МБ, Octal (WROOM-1 N16R8) ---
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+
+# --- Таблица разделов ---
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# --- lwIP / TCP ---
+CONFIG_LWIP_TCP_ISN_HOOK=y
+
+# --- Логирование ---
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
