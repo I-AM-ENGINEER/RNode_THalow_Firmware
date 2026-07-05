@@ -1,5 +1,7 @@
 # RNode-HaLow (ESP32-S3)
 
+> Repository: <https://github.com/I-AM-ENGINEER/RNode_Halow_Firmware>
+
 [English](#english) | [Русский](#русский)
 
 ---
@@ -10,6 +12,10 @@ Firmware for the ESP32-S3-WROOM-1 that turns the board into a Bluetooth KISS
 modem bridged to a WiFi HaLow radio over SLIP/TCP.
 
 The ESP32 acts as a transparent bridge.
+
+> **Compatibility:** The T-Halow board is supported by `rnodeconf` (the RNode
+> flasher) starting from version **2.2.0b** and newer. Older versions will not
+> recognise the board.
 
 ### Features
 
@@ -129,6 +135,9 @@ software, you may choose not to use this project.
 связанный с WiFi HaLow радиомодулем через SLIP/TCP.
 
 ESP32 работает как прозрачный мост.
+
+> **Совместимость:** Плата T-Halow поддерживается `rnodeconf` (прошивальщик
+> RNode) начиная с версии **2.2.0b** и новее. Старые версии не распознают плату.
 
 ### Возможности
 
