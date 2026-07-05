@@ -1,8 +1,8 @@
-# Name,   Type, SubType, Offset,  Size,     Flags
-# NVS (24 KiB) и PHY (4 KiB) — стандартно после bootloader @ 0x9000.
+# Name,   Type, SubType, Offset,  Size,    Flags
+# NVS (24 KiB) and PHY (4 KiB) - standard layout after bootloader at 0x9000.
 nvs,      data, nvs,     0x9000,  0x6000,
 phy_init, data, phy,     0xf000,  0x1000,
-# Приложение (factory) — 3 МБ с 0x10000.
+# Application (factory) - 3 MB starting at 0x10000.
 factory,  app,  factory, 0x10000, 0x300000,
-# Хранилище (FAT) — 4 МБ.
+# Storage (FAT) - 4 MB.
 storage,  data, fat,     ,        0x400000,

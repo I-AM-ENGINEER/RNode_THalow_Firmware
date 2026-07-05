@@ -4,8 +4,7 @@
 extern "C" {
 #endif
 
-/* Board / module identifier. */
-const char *rnode_halow_board_name(void);
+void status_led_init( void );
 
 #ifdef __cplusplus
 }

@@ -15,6 +15,7 @@ CMakeFiles/
 .vscode/
 .idea/
 .cache/
+.kilo/
 
 # Python
 __pycache__/
