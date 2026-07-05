@@ -7,10 +7,10 @@ Collects build artifacts (bootloader, partition table, application) into an
 cross-platform flash script, a README, and an optional zip archive.
 
 Usage:
-    python utils/make_release.py                 # package existing build/
-    python utils/make_release.py --build         # rebuild first, then package
-    python utils/make_release.py --zip           # also create zip archive
-    python utils/make_release.py --build -v 1.1.0 --zip
+    python utils/make_release.py                     # package + zip existing build/
+    python utils/make_release.py -v v0.2.0           # specify version
+    python utils/make_release.py --build -v v1.0.0   # rebuild then package
+    python utils/make_release.py --no-zip            # skip zip
 """
 
 import argparse
@@ -233,7 +233,7 @@ def main():
     parser = argparse.ArgumentParser(description="Prepare RNode-HaLow firmware release")
     parser.add_argument("--build", action="store_true", help="Run idf.py build before packaging")
     parser.add_argument("-v", "--version", default="v0.1.0b", help="Firmware version string (default: v0.1.0b)")
-    parser.add_argument("--zip", action="store_true", help="Also create a zip archive")
+    parser.add_argument("--no-zip", action="store_true", help="Skip creating the zip archive")
     args = parser.parse_args()
 
     if args.build:
@@ -291,8 +291,8 @@ def main():
         f.write("\n")
     print("  release.json")
 
-    # Optional zip
-    if args.zip:
+    # Create zip (default)
+    if not args.no_zip:
         print("== Creating zip archive ==")
         zip_name = f"rnode_firmware_thalow_{args.version}.zip"
         zip_path = os.path.join(os.path.dirname(OUT_DIR), zip_name)

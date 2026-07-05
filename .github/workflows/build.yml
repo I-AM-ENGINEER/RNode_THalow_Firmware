@@ -25,7 +25,7 @@ jobs:
           target: esp32s3
 
       - name: Package release
-        run: python utils/make_release.py --zip -v "${{ inputs.version }}"
+        run: python utils/make_release.py -v "${{ inputs.version }}"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
