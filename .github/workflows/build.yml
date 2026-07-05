@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version string (e.g. 0.1.0b)"
+        description: "Version string with v prefix (e.g. v0.1.0b)"
         required: true
-        default: "0.1.0b"
+        default: "v0.1.0b"
 
 permissions:
   contents: write
@@ -41,8 +41,8 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ inputs.version }}
-          name: v${{ inputs.version }}
+          tag_name: ${{ inputs.version }}
+          name: ${{ inputs.version }}
           files: |
             rnode_firmware_thalow_*.zip
             out/release.json
