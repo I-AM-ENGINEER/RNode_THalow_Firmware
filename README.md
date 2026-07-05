@@ -1,6 +1,6 @@
 # RNode-HaLow (ESP32-S3)
 
-> Repository: <https://github.com/I-AM-ENGINEER/RNode_Halow_Firmware>
+TWX8301 (HaLow module) Firmware: <https://github.com/I-AM-ENGINEER/RNode_Halow_Firmware>
 
 [English](#english) | [Русский](#русский)
 
