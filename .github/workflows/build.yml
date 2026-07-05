@@ -25,7 +25,10 @@ jobs:
           target: esp32s3
 
       - name: Build
-        run: idf.py build
+        shell: bash
+        run: |
+          . $IDF_PATH/export.sh
+          idf.py build
 
       - name: Package release
         run: python utils/make_release.py --zip -v "${{ inputs.version }}"

@@ -183,13 +183,6 @@ static void ble_advertise( void ) {
 	ESP_LOGI(TAG, "advertising started");
 }
 
-/* Restart advertising so a scan-response change (e.g. name visibility)
- * takes effect immediately. Safe to call from any task. */
-static void ble_advertise_restart( void ) {
-	ble_gap_adv_stop();
-	ble_advertise();
-}
-
 /* ------------------------------------------------------------------ */
 /* GAP events                                                         */
 /* ------------------------------------------------------------------ */
