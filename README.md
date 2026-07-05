@@ -1,4 +1,4 @@
-# RNode-HaLow (ESP32-S3)
+# RNode-THaLow ESP32
 
 TWX8301 (HaLow module) Firmware: <https://github.com/I-AM-ENGINEER/RNode_Halow_Firmware>
 
