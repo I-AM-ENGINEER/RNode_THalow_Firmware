@@ -14,8 +14,9 @@ modem bridged to a WiFi HaLow radio over SLIP/TCP.
 The ESP32 acts as a transparent bridge.
 
 > **Compatibility:** The T-Halow board is supported by `rnodeconf` (the RNode
-> flasher) starting from version **2.2.0b** and newer. Older versions will not
-> recognise the board.
+> flasher) starting from version **2.2.0b** and newer. Older versions will
+> brick the HaLow module and require reflashing it with an external SPI
+> programmer (CH341A).
 
 ### Features
 
@@ -137,7 +138,8 @@ software, you may choose not to use this project.
 ESP32 работает как прозрачный мост.
 
 > **Совместимость:** Плата T-Halow поддерживается `rnodeconf` (прошивальщик
-> RNode) начиная с версии **2.2.0b** и новее. Старые версии не распознают плату.
+> RNode) начиная с версии **2.2.0b** и новее. Старые версии окирпичивают
+> радиомодуль HaLow и требуют прошивки внешним SPI-программатором (CH341A).
 
 ### Возможности
 
