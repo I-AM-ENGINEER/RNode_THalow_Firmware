@@ -1,0 +1,49 @@
+name: Build Firmware
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version string (e.g. 0.1.0b)"
+        required: true
+        default: "0.1.0b"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: ESP-IDF setup
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp-idf-version: v5.4.4
+          target: esp32s3
+
+      - name: Build
+        run: idf.py build
+
+      - name: Package release
+        run: python utils/make_release.py --zip -v "${{ inputs.version }}"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rnode-halow-firmware
+          path: |
+            out/
+            rnode_firmware_thalow_*.zip
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ inputs.version }}
+          name: v${{ inputs.version }}
+          files: |
+            rnode_firmware_thalow_*.zip
+            out/release.json
+          generate_release_notes: true

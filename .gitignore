@@ -1,5 +1,7 @@
 # ESP-IDF build output
 build/
+out/
+rnode_firmware_*.zip
 sdkconfig
 sdkconfig.old
 dependencies.lock
