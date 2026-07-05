@@ -43,6 +43,7 @@ jobs:
         with:
           tag_name: ${{ inputs.version }}
           name: ${{ inputs.version }}
+          prerelease: true
           files: |
             rnode_firmware_thalow_*.zip
             out/release.json
