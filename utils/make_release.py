@@ -2,12 +2,16 @@
 """
 Prepares a flashable release package for the RNode-HaLow firmware.
 
-Collects build artifacts (bootloader, partition table, application) into an
-``out/`` folder, generates a SHA256 manifest (release.json), a ready-to-run
-cross-platform flash script, a README, and an optional zip archive.
+Produces a zip in RNode-Firmware convention:
+  rnode_firmware_thalow.bin          - application image
+  rnode_firmware_thalow.bootloader   - ESP32-S3 bootloader
+  rnode_firmware_thalow.partitions   - partition table
+  rnode_firmware_thalow.boot_app0   - OTA data (otadata initial)
+  esptool.py                         - standalone esptool wrapper
+  release.json                       - version + SHA256 (rnodeconf format)
 
 Usage:
-    python utils/make_release.py                     # package + zip existing build/
+    python utils/make_release.py                     # package existing build/
     python utils/make_release.py -v v0.2.0           # specify version
     python utils/make_release.py --build -v v1.0.0   # rebuild then package
     python utils/make_release.py --no-zip            # skip zip
@@ -26,12 +30,16 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD_DIR = os.path.join(REPO_ROOT, "build")
 OUT_DIR = os.path.join(REPO_ROOT, "out")
 
+FW_PREFIX = "rnode_firmware_thalow"
+ZIP_NAME = FW_PREFIX + ".zip"
+
 # Build artifact -> (relative build path, flash offset)
-ARTIFACTS = {
-    "bootloader.bin":       ("bootloader/bootloader.bin",           "0x0"),
-    "partition-table.bin":  ("partition_table/partition-table.bin", "0x8000"),
-    "rnode-halow.bin":      ("rnode-halow.bin",                     "0x10000"),
-}
+ARTIFACTS = [
+    (FW_PREFIX + ".bin",         "rnode-halow.bin",                     "0x10000"),
+    (FW_PREFIX + ".bootloader",  "bootloader/bootloader.bin",            "0x0"),
+    (FW_PREFIX + ".partitions",  "partition_table/partition-table.bin",  "0x8000"),
+    (FW_PREFIX + ".boot_app0",   "ota_data_initial.bin",                 "0xe000"),
+]
 
 FLASH_SETTINGS = {
     "chip": "esp32s3",
@@ -40,23 +48,51 @@ FLASH_SETTINGS = {
     "size": "16MB",
 }
 
-FLASH_SCRIPT = r'''#!/usr/bin/env python3
+# Standalone esptool wrapper – auto-installs esptool via pip if missing.
+ESPTOOL_PY = r'''#!/usr/bin/env python3
+"""Standalone esptool wrapper.
+
+Behaves like a single-file esptool.py: if the ``esptool`` package is not
+installed, it is installed via pip, then esptool's CLI entry point is invoked.
+This mirrors the esptool.py shipped inside RNode firmware release zips.
+"""
+import sys
+
+def _ensure_esptool():
+    try:
+        import esptool  # noqa: F401
+    except ImportError:
+        print("esptool not found, installing via pip...")
+        import subprocess
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "esptool"])
+        import esptool  # noqa: F401
+
+if __name__ == "__main__":
+    _ensure_esptool()
+    import esptool
+    esptool._main()
+'''
+
+# Cross-platform flash script bundled in the zip.
+FLASH_PY = r'''#!/usr/bin/env python3
 """
 Flashes the RNode-HaLow firmware to an ESP32-S3 over USB/serial.
 
 Auto-detects the serial port (or use --port), flashes bootloader, partition
-table, and application with esptool. esptool is installed via pip on first run
-if not present.
+table, boot_app0 and application with esptool.  esptool is installed via pip
+on first run if not present.
 
 Usage:
-    python flash.py                  # auto-detect port
-    python flash.py --port COM5      # specify port
-    python flash.py --port COM5 --erase   # clean install
+    python flash.py                       # auto-detect port
+    python flash.py --port COM6           # specify port
+    python flash.py --port COM6 --erase   # clean install (erase first)
 """
 
 import argparse
+import os
 import subprocess
 import sys
+import glob
 
 
 def install_esptool():
@@ -74,18 +110,11 @@ def esptool_available():
 
 
 def auto_detect_port():
-    import glob
     candidates = []
-
-    # Linux: /dev/ttyUSB*, /dev/ttyACM*
     candidates += glob.glob("/dev/ttyUSB*")
     candidates += glob.glob("/dev/ttyACM*")
-
-    # macOS: /dev/cu.usbserial-*, /dev/cu.usbmodem*
     candidates += glob.glob("/dev/cu.usbserial*")
     candidates += glob.glob("/dev/cu.usbmodem*")
-
-    # Windows: COM ports via registry
     if sys.platform == "win32":
         try:
             import winreg
@@ -101,14 +130,13 @@ def auto_detect_port():
                         break
         except Exception:
             pass
-
     candidates = sorted(set(candidates))
     return candidates[0] if candidates else None
 
 
 def main():
     p = argparse.ArgumentParser(description="Flash RNode-HaLow firmware to ESP32-S3")
-    p.add_argument("--port", help="Serial port (e.g. COM5, /dev/ttyACM0)")
+    p.add_argument("--port", help="Serial port (e.g. COM6, /dev/ttyACM0)")
     p.add_argument("--baud", type=int, default=921600, help="Flash baud rate (default: 921600)")
     p.add_argument("--erase", action="store_true", help="Erase entire flash first (clean install)")
     args = p.parse_args()
@@ -139,17 +167,21 @@ def main():
 
     print("Flashing firmware...")
     files = [
-        ("0x0",     os.path.join(here, "bootloader.bin")),
-        ("0x8000",  os.path.join(here, "partition-table.bin")),
-        ("0x10000", os.path.join(here, "rnode-halow.bin")),
+        ("0x0",     os.path.join(here, "rnode_firmware_thalow.bootloader")),
+        ("0x8000",  os.path.join(here, "rnode_firmware_thalow.partitions")),
+        ("0xe000",  os.path.join(here, "rnode_firmware_thalow.boot_app0")),
+        ("0x10000", os.path.join(here, "rnode_firmware_thalow.bin")),
     ]
     flash_cmd = base + [
-        "write_flash",
+        "write_flash", "-z",
         "--flash_mode", "dio",
         "--flash_freq", "80m",
         "--flash_size", "16MB",
     ]
     for offset, path in files:
+        if not os.path.isfile(path):
+            print(f"ERROR: Missing {path}")
+            sys.exit(1)
         flash_cmd += [offset, path]
 
     subprocess.check_call(flash_cmd)
@@ -163,21 +195,23 @@ if __name__ == "__main__":
     main()
 '''
 
-RELEASE_README = """# RNode-HaLow Firmware Release v{version}
+RELEASE_README = """# RNode-HaLow Firmware Release {version}
 
 ## Contents
-- `bootloader.bin`        - ESP32-S3 bootloader (flash @ 0x0)
-- `partition-table.bin`   - Partition layout (flash @ 0x8000)
-- `rnode-halow.bin`       - Application firmware (flash @ 0x10000)
-- `flash.py`              - Cross-platform flash script (auto-detects port)
-- `release.json`         - SHA256 hashes, offsets, flash settings
+- `rnode_firmware_thalow.bin`         - Application firmware (flash @ 0x10000)
+- `rnode_firmware_thalow.bootloader`   - ESP32-S3 bootloader (flash @ 0x0)
+- `rnode_firmware_thalow.partitions`   - Partition table (flash @ 0x8000)
+- `rnode_firmware_thalow.boot_app0`    - OTA data (flash @ 0xe000)
+- `esptool.py`                         - Standalone esptool wrapper
+- `flash.py`                           - Cross-platform flash script
+- `release.json`                       - Version + SHA256 manifest
 
 ## Quick flash
 
 ### Windows
 ```
 python flash.py
-python flash.py --port COM5 --erase
+python flash.py --port COM6 --erase
 ```
 
 ### Linux / macOS
@@ -191,11 +225,14 @@ The script auto-installs `esptool` via pip if not present.
 ## Flash with esptool manually
 
 ```
-python -m esptool --chip esp32s3 --port COM5 --baud 921600 write_flash \\
+python -m esptool --chip esp32s3 --port COM6 --baud 921600 \\
+    --before default_reset --after hard_reset \\
+    write_flash -z \\
     --flash_mode dio --flash_freq 80m --flash_size 16MB \\
-    0x0     bootloader.bin \\
-    0x8000  partition-table.bin \\
-    0x10000 rnode-halow.bin
+    0x0     rnode_firmware_thalow.bootloader \\
+    0x8000  rnode_firmware_thalow.partitions \\
+    0xe000  rnode_firmware_thalow.boot_app0 \\
+    0x10000 rnode_firmware_thalow.bin
 ```
 
 ## Requirements
@@ -205,7 +242,7 @@ python -m esptool --chip esp32s3 --port COM5 --baud 921600 write_flash \\
 ## After flashing
 1. Power on the device.
 2. Scan for BLE devices and pair.
-3. Connect from a KISS-compatible client (Columba, Sideband, Reticulum).
+3. Connect from a KISS-compatible client (Columba, Sideband).
 """
 
 
@@ -213,7 +250,6 @@ def run_build():
     print("== Building firmware ==")
     idf_path = os.environ.get("IDF_PATH", "")
     if idf_path and os.path.exists(os.path.join(idf_path, "export.ps1")):
-        # Windows: source export.ps1 in PowerShell
         cmd = ["powershell", "-Command",
                f". '{idf_path}\\export.ps1' *> $null; idf.py build"]
     else:
@@ -240,7 +276,7 @@ def main():
         run_build()
 
     # Verify artifacts
-    for name, (rel, _off) in ARTIFACTS.items():
+    for _name, rel, _off in ARTIFACTS:
         path = os.path.join(BUILD_DIR, rel)
         if not os.path.exists(path):
             print(f"ERROR: Missing build artifact: {path}", file=sys.stderr)
@@ -252,60 +288,89 @@ def main():
         shutil.rmtree(OUT_DIR)
     os.makedirs(OUT_DIR)
 
+    # Stage files in a temp subfolder so the zip never packs itself.
+    pkg_dir = os.path.join(OUT_DIR, "_pkg")
+
     print("== Collecting artifacts ==")
 
     manifest = {}
-    for name, (rel, offset) in ARTIFACTS.items():
+    for name, rel, offset in ARTIFACTS:
         src = os.path.join(BUILD_DIR, rel)
-        dst = os.path.join(OUT_DIR, name)
+        dst = os.path.join(pkg_dir, name)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
         shutil.copy2(src, dst)
         size = os.path.getsize(dst)
         digest = sha256(dst)
         manifest[name] = {"offset": offset, "sha256": digest, "size": size}
-        print(f"  {name:<22} {size:>8} bytes  {digest}")
+        print(f"  {name:<38} {size:>8} bytes  {digest}")
+
+    # esptool.py (standalone wrapper)
+    esptool_path = os.path.join(pkg_dir, "esptool.py")
+    with open(esptool_path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(ESPTOOL_PY)
+    if os.name != "nt":
+        os.chmod(esptool_path, 0o755)
+    print("  esptool.py")
 
     # flash.py
-    flash_path = os.path.join(OUT_DIR, "flash.py")
+    flash_path = os.path.join(pkg_dir, "flash.py")
     with open(flash_path, "w", encoding="utf-8", newline="\n") as f:
-        f.write(FLASH_SCRIPT)
+        f.write(FLASH_PY)
     if os.name != "nt":
         os.chmod(flash_path, 0o755)
     print("  flash.py")
 
     # README.md
-    readme_path = os.path.join(OUT_DIR, "README.md")
+    readme_path = os.path.join(pkg_dir, "README.md")
     with open(readme_path, "w", encoding="utf-8", newline="\n") as f:
         f.write(RELEASE_README.format(version=args.version))
     print("  README.md")
 
-    # release.json
-    release = {
+    # release.json (inside the zip: version, flash settings, per-file hashes).
+    # This is stable – it does NOT include the zip hash, so creating the zip
+    # does not change its own hash.
+    json_path = os.path.join(pkg_dir, "release.json")
+    release_internal = {
         "version": args.version,
-        "chip": FLASH_SETTINGS["chip"],
-        "flash": {k: v for k, v in FLASH_SETTINGS.items() if k != "chip"},
+        "flash": {k: v for k, v in FLASH_SETTINGS.items()},
         "files": manifest,
     }
-    json_path = os.path.join(OUT_DIR, "release.json")
     with open(json_path, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(release, f, indent=2)
+        json.dump(release_internal, f, indent=2)
         f.write("\n")
     print("  release.json")
 
-    # Create zip (default)
+    # Create zip.  Zip lives at out/ root, contents from _pkg/.
     if not args.no_zip:
         print("== Creating zip archive ==")
-        zip_name = f"rnode_firmware_thalow_{args.version}.zip"
-        zip_path = os.path.join(os.path.dirname(OUT_DIR), zip_name)
+        zip_path = os.path.join(OUT_DIR, ZIP_NAME)
         if os.path.exists(zip_path):
             os.remove(zip_path)
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            for root, _dirs, files in os.walk(OUT_DIR):
+            for root, _dirs, files in os.walk(pkg_dir):
                 for fname in sorted(files):
                     fpath = os.path.join(root, fname)
-                    arcname = os.path.relpath(fpath, OUT_DIR)
+                    arcname = os.path.relpath(fpath, pkg_dir)
                     zf.write(fpath, arcname)
         zip_size = os.path.getsize(zip_path)
-        print(f"  {zip_name}  ({zip_size // 1024} KB)  {sha256(zip_path)}")
+        zip_hash = sha256(zip_path)
+        print(f"  {ZIP_NAME}  ({zip_size // 1024} KB)  {zip_hash}")
+
+        # Standalone release.json in rnodeconf format: { "zip_name": { "version", "hash" } }
+        # rnodeconf downloads this file separately and uses the hash to verify the zip.
+        rnodeconf_release = {
+            ZIP_NAME: {
+                "version": args.version,
+                "hash": zip_hash,
+            }
+        }
+        with open(os.path.join(OUT_DIR, "release.json"), "w",
+                  encoding="utf-8", newline="\n") as f:
+            json.dump(rnodeconf_release, f, indent=2)
+            f.write("\n")
+
+    # Remove the staging folder so out/ only contains the zip + release.json.
+    shutil.rmtree(pkg_dir, ignore_errors=True)
 
     print()
     print(f"Release ready in: {OUT_DIR}")

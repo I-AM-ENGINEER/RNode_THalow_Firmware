@@ -32,8 +32,8 @@ jobs:
         with:
           name: rnode-halow-firmware
           path: |
-            out/
-            rnode_firmware_thalow_*.zip
+            out/rnode_firmware_thalow.zip
+            out/release.json
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -42,6 +42,6 @@ jobs:
           name: ${{ inputs.version }}
           prerelease: true
           files: |
-            rnode_firmware_thalow_*.zip
+            out/rnode_firmware_thalow.zip
             out/release.json
           generate_release_notes: true

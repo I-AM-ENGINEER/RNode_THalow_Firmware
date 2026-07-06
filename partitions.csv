@@ -1,8 +1,9 @@
-# Name,   Type, SubType, Offset,  Size,    Flags
-# NVS (24 KiB) and PHY (4 KiB) - standard layout after bootloader at 0x9000.
-nvs,      data, nvs,     0x9000,  0x6000,
-phy_init, data, phy,     0xf000,  0x1000,
-# Application (factory) - 3 MB starting at 0x10000.
-factory,  app,  factory, 0x10000, 0x300000,
-# Storage (FAT) - 4 MB.
-storage,  data, fat,     ,        0x400000,
+# Name,   Type, SubType, Offset,  Size,     Flags
+# NVS (20 KiB) at 0x9000, ends at 0xe000 (before otadata).
+nvs,      data, nvs,     0x9000,  0x5000,
+# OTA data (8 KiB) at 0xe000 - boot_app0 / otadata partition.
+otadata,  data, ota,     0xe000,  0x2000,
+# Application (factory) - 2 MB starting at 0x10000.
+factory,  app,  factory, 0x10000, 0x200000,
+# Storage (FAT) - 2 MB starting at 0x210000 (console_image area).
+storage,  data, fat,     0x210000,0x1F0000,
