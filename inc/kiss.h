@@ -8,7 +8,10 @@
 extern "C" {
 #endif
 
-#define KISS_FRAME_MAX (512)
+/* Max size of a KISS frame payload (NOT counting the KISS command byte,
+ * FEND framing or escaping). Must be >= RNS_FRAMING_MAX_PACKET (1024) so a
+ * full RNS packet can round-trip through KISS without truncation. */
+#define KISS_FRAME_MAX (1024)
 
 typedef void (*kiss_tx_cb)( void *user, const uint8_t *buf, size_t len );
 typedef void (*kiss_data_cb)( void *user, const uint8_t *data, size_t len );

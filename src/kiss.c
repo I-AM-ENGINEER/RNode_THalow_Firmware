@@ -9,6 +9,11 @@
 #define TFESC             0xDD
 
 #define CMD_DATA          0x00
+#define CMD_FREQUENCY     0x01
+#define CMD_BANDWIDTH     0x02
+#define CMD_TXPOWER       0x03
+#define CMD_SF            0x04
+#define CMD_CR            0x05
 #define CMD_RADIO_STATE   0x06
 #define CMD_DETECT        0x08
 #define CMD_PROMISC       0x0E
@@ -26,13 +31,22 @@
 #define RADIO_ON          0x01
 
 #define PLATFORM_ESP32    0x80
-#define MCU_ESP32         0x81
+#define MCU_ESP32_S3      0x87   /* ESP32-S3 (markqvist RNS: MCU_ESP32_S3) */
 #define BOARD_MODEL       0x42
+/* RNS REQUIRED_FW_VER_MAJ=1, REQUIRED_FW_VER_MIN=52 (0x34). A value below
+ * this is HARD-REJECTED by RNS Python (RNodeInterface.detect raises IOError),
+ * Sideband, and Columba-Python -- but NOT by Columba-Kotlin, which is why
+ * only Kotlin worked. Report 1.89 (0x59), the current upstream RNode version,
+ * to stay comfortably above the floor. See:
+ * https://github.com/markqvist/Reticulum/blob/master/RNS/Interfaces/RNodeInterface.py
+ * Decoding convention is fixed: byte[0]=major, byte[1]=minor, plain ints. */
 #define FW_MAJOR          0x01
-#define FW_MINOR          0x00
+#define FW_MINOR          0x59
 
 static void send_kiss( kiss_t *k, uint8_t cmd, const uint8_t *data, int len ) {
-	uint8_t buf[KISS_FRAME_MAX + 8];
+	/* Worst-case frame size: every payload byte escaped (2 bytes each) +
+	 * FEND + cmd + trailing FEND = 2*len + 4. Allocated generously. */
+	uint8_t buf[KISS_FRAME_MAX * 2 + 8];
 	int pos = 0;
 
 	buf[pos++] = FEND;
@@ -67,6 +81,19 @@ static void handle_frame( kiss_t *k, const uint8_t *frame, int len ) {
 		if (k->data_cb)
 			k->data_cb(k->data_user, frame + 1, len - 1);
 		break;
+	/* Radio-config echo handlers. This device has no real LoRa radio --
+	 * the HaLow module is the actual RF path. But Reticulum's initRadio()
+	 * sends frequency/bandwidth/txpower/SF/CR during connect and validateRadioState()
+	 * rejects the interface unless the device echoes them back. Echo whatever
+	 * the host sent so the validation passes. Stock RNS (desktop + Sideband)
+	 * needs this; Columba skips the LoRa validation. */
+	case CMD_FREQUENCY:
+	case CMD_BANDWIDTH:
+	case CMD_TXPOWER:
+	case CMD_SF:
+	case CMD_CR:
+		send_kiss(k, cmd, frame + 1, len - 1);
+		break;
 
 	case CMD_DETECT:
 		if (val == DETECT_REQ) {
@@ -82,7 +109,7 @@ static void handle_frame( kiss_t *k, const uint8_t *frame, int len ) {
 	}
 
 	case CMD_MCU: {
-		uint8_t m = MCU_ESP32;
+		uint8_t m = MCU_ESP32_S3;
 		send_kiss(k, CMD_MCU, &m, 1);
 		break;
 	}

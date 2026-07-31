@@ -23,6 +23,11 @@ ble_state_t ble_get_state( void );
 uint32_t ble_get_passkey( void );
 bool ble_connected( void );
 
+/* Temporarily disable/enable the BLE controller (e.g. to free the radio for
+ * a longer WiFi scan). No-op if BLE is disabled by config or already paused. */
+void ble_pause( void );
+void ble_resume( void );
+
 int ble_available( void );
 int ble_read( void );
 size_t ble_read_bytes( uint8_t *buf, size_t len );
