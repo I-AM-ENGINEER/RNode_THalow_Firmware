@@ -35,3 +35,9 @@ Thumbs.db
 _build.bat
 build.log
 size_log.txt
+
+# Test binaries (host-side)
+tests/*.exe
+tests/test_rns_framing
+tests/test_kiss
+tests/test_dns_overflow
