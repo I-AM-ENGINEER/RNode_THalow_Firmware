@@ -1,2 +1,6 @@
 dependencies:
   espressif/mdns: "^1.4.0"
+  # cJSON. Built into ESP-IDF <= v5.x as component "json", but removed from
+  # the core in IDF v6.x and published to the Component Registry instead.
+  # Declaring it here makes the build work on both v5.4 and v6.x.
+  espressif/cjson: "^1.7.18"
