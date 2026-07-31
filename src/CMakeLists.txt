@@ -1,20 +1,18 @@
+# cJSON: in IDF <= v5.x it ships as the built-in component "json". In v6.x it
+# was removed from the core and is pulled from the Component Registry as
+# "espressif/cjson" (component name "cjson"). Resolve the right name BEFORE
+# idf_component_register so REQUIRES picks it up. idf_component_get_property
+# FATAL_ERRORs if the component does not exist, so we cannot probe at runtime.
+if(IDF_VER MATCHES "^v?5")
+    set(_JSON_REQ json)
+else()
+    set(_JSON_REQ cjson)
+endif()
+
 idf_component_register(                        SRCS "button.c" "status_led.c" "battery.c" "rns_framing.c" "kiss.c" "ble.c" "main.c" "system.c" "slip.c" "thalow_config.c" "wifi.c" "web_proxy.c" "gzip_inflate.c" "captive_portal.c" "firewall.c" "rns_proxy.c" "switch.c"
                         INCLUDE_DIRS "../inc"
                         PRIV_REQUIRES nvs_flash
-                        REQUIRES esp_event esp_netif esp_driver_uart esp_driver_gpio lwip bt esp_wifi esp_http_server esp_http_client esp_timer esp_psram esp_driver_tsens esp_adc spi_flash esp_hw_support esp_common esp_system mdns)
-
-# cJSON: in IDF <= v5.x it ships as the built-in component "json". In v6.x it
-# was removed from the core and is pulled from the Component Registry as
-# "espressif/cjson" (component name "cjson"). idf_component_get_property
-# FATAL_ERRORs if the component doesn't exist, so we branch on the IDF major
-# version instead of probing at configure time.
-if(IDF_VER MATCHES "^v?5")
-    idf_component_get_property(_json_lib json COMPONENT_LIB)
-    target_link_libraries(${COMPONENT_LIB} PUBLIC ${_json_lib})
-else()
-    idf_component_get_property(_cjson_lib cjson COMPONENT_LIB)
-    target_link_libraries(${COMPONENT_LIB} PUBLIC ${_cjson_lib})
-endif()
+                        REQUIRES esp_event esp_netif esp_driver_uart esp_driver_gpio lwip bt esp_wifi esp_http_server esp_http_client esp_timer esp_psram esp_driver_tsens esp_adc spi_flash esp_hw_support esp_common esp_system mdns ${_JSON_REQ})
 
 target_add_binary_data(${COMPONENT_LIB} "../web/thalow_inject.js" TEXT)
 
