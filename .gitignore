@@ -30,3 +30,8 @@ docs/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local-only build helpers / logs
+_build.bat
+build.log
+size_log.txt
