@@ -23,7 +23,20 @@ CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
 # --- lwIP / TCP ---
+# High socket budget: each proxied request holds TWO sockets (one httpd
+# client socket + one esp_http_client socket to the radio), and browsers
+# open 6+ connections in parallel plus OS captive-portal probes. 24 was too
+# tight and caused "Failed to create socket" / accept() failures. 48 with
+# larger TCP mailboxes gives headroom on this PSRAM-rich target.
 CONFIG_LWIP_TCP_ISN_HOOK=y
+CONFIG_LWIP_MAX_SOCKETS=56
+# Active TCP PCB pool (MEMP_NUM_TCP_PCB). Default 16 is too tight: httpd
+# client sockets + esp_http_client sockets + halow_link + RNS proxy all share
+# this pool. Bump to 32 so bursts of proxied requests don't exhaust it.
+CONFIG_LWIP_MAX_ACTIVE_TCP=32
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=24
+CONFIG_LWIP_TCP_ACCEPTMBOX_SIZE=24
 
 # --- Logging ---
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
@@ -31,6 +44,12 @@ CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 # --- BLE (NimBLE) ---
 CONFIG_BT_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLED=y
+# BT controller on core 1 to isolate it from the WiFi task (core 0). Both
+# radio stacks on the same core causes coex-arbitration latency spikes that
+# lead to bcn_timeout when BLE + APSTA are simultaneously active. ESP32-S3
+# has two cores; putting BT controller on core 1 gives the coex arbiter its
+# own CPU budget so it can resolve RF conflicts without starving WiFi.
+CONFIG_BT_CTRL_PINNED_TO_CORE_1=y
 CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
 CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
 CONFIG_BT_NIMBLE_NVS_PERSIST=y
@@ -40,3 +59,13 @@ CONFIG_BT_NIMBLE_MAX_CCCDS=3
 CONFIG_BT_NIMBLE_MAX_ATT_MTU=512
 CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=512
 CONFIG_BT_NIMBLE_LOG_LEVEL_WARNING=y
+
+# --- WiFi / SoftAP ---
+CONFIG_ESP_WIFI_ENABLED=y
+CONFIG_ESP_WIFI_NVS_ENABLED=y
+
+# --- HTTP server / client ---
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=2048
+CONFIG_HTTPD_MAX_URI_LEN=256
+CONFIG_HTTPD_WS_SUPPORT=n
+CONFIG_ESP_HTTP_CLIENT_ENABLE_BASIC_AUTH=n
