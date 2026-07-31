@@ -8,6 +8,8 @@ extern "C" {
 
 typedef enum {
 	BUTTON_EVENT_LONG_PRESS,
+	BUTTON_EVENT_SHORT_PRESS,
+	BUTTON_EVENT_VERY_LONG_PRESS,
 } button_event_t;
 
 typedef void (*button_callback_t)(button_event_t event);
