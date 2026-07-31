@@ -1,0 +1,711 @@
+#include <string.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/event_groups.h"
+
+#include "esp_log.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "esp_timer.h"
+
+#include "lwip/def.h"
+#include "lwip/ip4_addr.h"
+
+#include "wifi.h"
+#include "thalow_config.h"
+#include "ble.h"
+#include "mdns.h"
+#include "config/project_config.h"
+
+static const char *TAG = "wifi";
+
+static esp_netif_t *ap_netif = NULL;
+static esp_netif_t *sta_netif = NULL;
+static bool handlers_registered = false;
+static bool s_wifi_inited = false;
+static bool s_mdns_inited = false;
+static char s_mdns_host[32] = {0};
+
+static void init_mdns(void) {
+	if (s_mdns_inited)
+		return;
+	s_mdns_inited = true;
+	if (mdns_init() != ESP_OK) {
+		ESP_LOGW(TAG, "mdns_init failed");
+		return;
+	}
+	char suffix[7];
+	thalow_config_mac_suffix(suffix, sizeof(suffix));
+	for (char *p = suffix; *p; p++)
+		if (*p >= 'A' && *p <= 'Z') *p += 32;
+	snprintf(s_mdns_host, sizeof(s_mdns_host), "rnode-halow-%s", suffix);
+	mdns_hostname_set(s_mdns_host);
+	mdns_instance_name_set("RNode HaLow");
+	mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
+	ESP_LOGI(TAG, "mDNS: %s.local", s_mdns_host);
+}
+
+/* Background reconnect never gives up. Instead of a fixed retry cap, we
+ * use exponential backoff capped at 60 s between attempts, so a transient
+ * bcn_timeout / router reboot / BT-coexistence blip recovers automatically
+ * instead of permanently stranding the STA uplink (and 192.168.x access
+ * to the web UI). A hard cap was the root cause of "STA disconnected,
+ * giving up" after which the device was unreachable over STA. */
+#define STA_BACKOFF_MIN_MS  (500)
+#define STA_BACKOFF_MAX_MS  (60000)
+static int sta_retry = 0;
+
+/* Deferred-reconnect state. The event handler runs in the sys/event task
+ * and must not block for tens of seconds, so for long backoffs we arm a
+ * one-shot esp_timer that calls esp_wifi_connect() later. */
+static esp_timer_handle_t s_sta_reconnect_timer = NULL;
+static volatile bool s_sta_reconnect_armed = false;
+
+#define STA_CONNECTED_BIT  BIT0
+#define STA_FAIL_BIT       BIT1
+/* Number of connect attempts before giving up on an interactive
+ * connect. 6 tries x ~5 s association timeout ~= 30 s budget, which
+ * gives a borderline AP enough time to respond while still bounding
+ * the worst-case wait in the HTTP handler. */
+#define STA_CONNECT_TRIES  (6)
+
+static EventGroupHandle_t s_wifi_eg = NULL;
+static volatile bool s_connect_pending = false;
+static int s_connect_tries = 0;
+static char s_fail_reason[48];
+static char s_got_ip[16];
+static volatile bool s_sta_connected = false;
+static volatile int s_ap_sta_count = 0;
+/* Set true when the STA has given up retrying (for the "failed"
+ * stats status). Cleared whenever a new connect attempt begins. */
+static volatile bool s_sta_failed = false;
+
+/* One-shot timer callback: fire esp_wifi_connect() for a deferred STA
+ * background reconnect (used when the exponential backoff exceeds the
+ * short delay we are willing to do inside the event handler). */
+static void sta_reconnect_timer_cb(void *arg) {
+	(void)arg;
+	s_sta_reconnect_armed = false;
+	if (thalow_config_get_wifi_sta_enabled() && !s_connect_pending) {
+		ESP_LOGI(TAG, "STA deferred reconnect firing");
+		esp_wifi_connect();
+	}
+}
+
+static void ensure_reconnect_timer(void) {
+	if (s_sta_reconnect_timer)
+		return;
+	const esp_timer_create_args_t a = {
+		.callback = sta_reconnect_timer_cb,
+		.name = "sta_recon",
+	};
+	esp_timer_create(&a, &s_sta_reconnect_timer);
+}
+
+static void on_wifi_event(void *arg, esp_event_base_t base,
+                          int32_t id, void *data) {
+	(void)arg;
+	if (base == WIFI_EVENT) {
+		switch (id) {
+		case WIFI_EVENT_AP_START:
+			ESP_LOGI(TAG, "AP started, SSID=%s",
+			         thalow_config_get_ssid());
+			break;
+		case WIFI_EVENT_AP_STOP:
+			ESP_LOGI(TAG, "AP stopped");
+			break;
+		case WIFI_EVENT_AP_STACONNECTED:
+			s_ap_sta_count++;
+			ESP_LOGI(TAG, "station connected to AP (%d)", s_ap_sta_count);
+			break;
+		case WIFI_EVENT_AP_STADISCONNECTED:
+			if (s_ap_sta_count > 0)
+				s_ap_sta_count--;
+			ESP_LOGI(TAG, "station disconnected from AP (%d)", s_ap_sta_count);
+			break;
+		case WIFI_EVENT_STA_START:
+			if (thalow_config_get_wifi_sta_enabled() || s_connect_pending) {
+				ESP_LOGI(TAG, "STA start, connecting...");
+				sta_retry = 0;
+				s_sta_failed = false;
+				esp_wifi_connect();
+			} else {
+				ESP_LOGI(TAG, "STA start, station disabled");
+			}
+			break;
+		case WIFI_EVENT_STA_DISCONNECTED: {
+			s_sta_connected = false;
+			wifi_event_sta_disconnected_t *d =
+				(wifi_event_sta_disconnected_t *)data;
+			uint8_t reason = d ? d->reason : 0;
+			if (s_connect_pending) {
+				bool auth_err = (reason == WIFI_REASON_AUTH_FAIL ||
+				                 reason == WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT ||
+				                 reason == WIFI_REASON_MIC_FAILURE);
+				bool no_ap = (reason == WIFI_REASON_NO_AP_FOUND);
+				/* Reason 8 (ASSOC_LEAVE) is generated by our own intentional
+				 * esp_wifi_disconnect() in wifi_sta_connect() — it is expected,
+				 * not a real failure, so don't burn a retry attempt for it. */
+				bool self_disconnect = (reason == WIFI_REASON_ASSOC_LEAVE);
+				if (!self_disconnect)
+					s_connect_tries++;
+				if (!auth_err && !no_ap &&
+				    s_connect_tries < STA_CONNECT_TRIES) {
+					ESP_LOGW(TAG, "STA connect retry %d, reason=%u",
+					         s_connect_tries, reason);
+					esp_wifi_connect();
+					break;
+				}
+				if (auth_err)
+					strlcpy(s_fail_reason,
+					        "Authentication failed (wrong password)",
+					        sizeof(s_fail_reason));
+				else if (no_ap)
+					strlcpy(s_fail_reason, "Network not found",
+					        sizeof(s_fail_reason));
+				else
+					strlcpy(s_fail_reason, "Connection failed",
+					        sizeof(s_fail_reason));
+				ESP_LOGE(TAG, "STA connect failed, reason=%u: %s",
+				         reason, s_fail_reason);
+				if (s_wifi_eg)
+					xEventGroupSetBits(s_wifi_eg, STA_FAIL_BIT);
+			} else if (thalow_config_get_wifi_sta_enabled()) {
+				/* Background disconnect (not from an interactive connect
+				 * attempt). Reconnect forever with exponential backoff so
+				 * the uplink self-heals after bcn_timeout / router reboots
+				 * / BT-coexistence blips. We do NOT set s_sta_failed here:
+				 * "failed" is reserved for an interactive attempt that
+				 * exhausted its tries, and a background disconnect is
+				 * always recoverable. */
+				sta_retry++;
+				int delay_ms = STA_BACKOFF_MIN_MS << (sta_retry - 1);
+				if (delay_ms > STA_BACKOFF_MAX_MS)
+					delay_ms = STA_BACKOFF_MAX_MS;
+				if (delay_ms <= STA_BACKOFF_MIN_MS) {
+					ESP_LOGW(TAG, "STA disconnected, reconnecting (try %d)",
+					         sta_retry);
+					vTaskDelay(pdMS_TO_TICKS(delay_ms));
+					esp_wifi_connect();
+				} else {
+					ESP_LOGW(TAG, "STA disconnected, reconnect in %d ms (try %d)",
+					         delay_ms, sta_retry);
+					ensure_reconnect_timer();
+					s_sta_reconnect_armed = true;
+					esp_timer_stop(s_sta_reconnect_timer);
+					esp_timer_start_once(s_sta_reconnect_timer,
+					                    delay_ms * 1000);
+				}
+			} else {
+				ESP_LOGI(TAG, "STA disconnected, station disabled");
+			}
+			break;
+		}
+		default:
+			break;
+		}
+	} else if (base == IP_EVENT) {
+		switch (id) {
+		case IP_EVENT_STA_GOT_IP: {
+			ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
+			sta_retry = 0;
+			s_sta_connected = true;
+			s_sta_failed = false;
+			/* Cancel any deferred background reconnect — we are up. */
+			if (s_sta_reconnect_timer) {
+				esp_timer_stop(s_sta_reconnect_timer);
+				s_sta_reconnect_armed = false;
+			}
+			if (e)
+				esp_ip4addr_ntoa(&e->ip_info.ip, s_got_ip,
+				                 sizeof(s_got_ip));
+			ESP_LOGI(TAG, "STA got IP %s", s_got_ip);
+			if (s_connect_pending && s_wifi_eg)
+				xEventGroupSetBits(s_wifi_eg, STA_CONNECTED_BIT);
+			break;
+		}
+		case IP_EVENT_AP_STAIPASSIGNED:
+			ESP_LOGI(TAG, "AP station got IP");
+			break;
+		default:
+			break;
+		}
+	}
+}
+
+static void build_ap_config(wifi_config_t *cfg) {
+	memset(cfg, 0, sizeof(*cfg));
+
+	const char *ssid = thalow_config_get_ssid();
+	size_t sl = strlen(ssid);
+	if (sl > 32) sl = 32;
+	memcpy(cfg->ap.ssid, ssid, sl);
+	cfg->ap.ssid_len = (uint8_t)sl;
+
+	const char *pw = thalow_config_get_password();
+	thalow_auth_t am = thalow_config_get_wifi_ap_authmode();
+
+	cfg->ap.pmf_cfg.capable = false;
+	cfg->ap.pmf_cfg.required = false;
+
+	switch (am) {
+	case THALOW_AUTH_WPA2:
+		cfg->ap.authmode = WIFI_AUTH_WPA2_PSK;
+		strncpy((char *)cfg->ap.password, pw,
+		        sizeof(cfg->ap.password) - 1);
+		cfg->ap.password[sizeof(cfg->ap.password) - 1] = '\0';
+		break;
+	case THALOW_AUTH_WPA3:
+		cfg->ap.authmode = WIFI_AUTH_WPA3_PSK;
+		strncpy((char *)cfg->ap.password, pw,
+		        sizeof(cfg->ap.password) - 1);
+		cfg->ap.password[sizeof(cfg->ap.password) - 1] = '\0';
+		cfg->ap.pmf_cfg.capable = true;
+		cfg->ap.pmf_cfg.required = true;
+		break;
+	case THALOW_AUTH_WPA2_WPA3:
+		cfg->ap.authmode = WIFI_AUTH_WPA2_WPA3_PSK;
+		strncpy((char *)cfg->ap.password, pw,
+		        sizeof(cfg->ap.password) - 1);
+		cfg->ap.password[sizeof(cfg->ap.password) - 1] = '\0';
+		cfg->ap.pmf_cfg.capable = true;
+		cfg->ap.pmf_cfg.required = false;
+		break;
+	case THALOW_AUTH_OPEN:
+	default:
+		cfg->ap.authmode = WIFI_AUTH_OPEN;
+		cfg->ap.password[0] = '\0';
+		break;
+	}
+
+	cfg->ap.channel = 1;
+	cfg->ap.max_connection = WIFI_AP_MAX_CONN;
+	cfg->ap.ssid_hidden = 0;
+}
+
+static void configure_ap(void) {
+	esp_netif_ip_info_t ip_info;
+	memset(&ip_info, 0, sizeof(ip_info));
+
+	const char *ap_ip = thalow_config_get_wifi_ap_ip();
+	const char *ap_nm = thalow_config_get_wifi_ap_netmask();
+
+	if (esp_netif_str_to_ip4(ap_ip, &ip_info.ip) != ESP_OK ||
+	    esp_netif_str_to_ip4(ap_nm, &ip_info.netmask) != ESP_OK) {
+		ESP_LOGE(TAG, "invalid AP IP/netmask, falling back to defaults");
+		ip4_addr_set_u32(&ip_info.ip, WIFI_AP_IP);
+		ip4_addr_set_u32(&ip_info.netmask, WIFI_AP_NETMASK);
+	}
+	ip4_addr_set_u32(&ip_info.gw, ip_info.ip.addr);
+
+	ESP_ERROR_CHECK(esp_netif_dhcps_stop(ap_netif));
+	ESP_ERROR_CHECK(esp_netif_set_ip_info(ap_netif, &ip_info));
+
+	/* Advertise our own IP as the DNS server so associated clients resolve
+	 * everything through the captive-portal DNS responder, and publish the
+	 * captive-portal URI so compliant clients show a "sign in" prompt. */
+	esp_netif_dns_info_t dns_info;
+	memset(&dns_info, 0, sizeof(dns_info));
+	dns_info.ip.type = ESP_IPADDR_TYPE_V4;
+	dns_info.ip.u_addr.ip4.addr = ip_info.ip.addr;
+	esp_netif_dhcps_option(ap_netif, ESP_NETIF_OP_SET,
+	                       ESP_NETIF_DOMAIN_NAME_SERVER, &dns_info,
+	                       sizeof(dns_info));
+
+	char cp_uri[64];
+	snprintf(cp_uri, sizeof(cp_uri), "http://" IPSTR "/",
+	         IP2STR(&ip_info.ip));
+	esp_netif_dhcps_option(ap_netif, ESP_NETIF_OP_SET,
+	                       ESP_NETIF_CAPTIVEPORTAL_URI, cp_uri,
+	                       (uint32_t)strlen(cp_uri));
+
+	ESP_ERROR_CHECK(esp_netif_dhcps_start(ap_netif));
+
+	wifi_config_t wifi_config;
+	build_ap_config(&wifi_config);
+	ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
+
+	ESP_LOGI(TAG, "SoftAP %s on %s/%s",
+	         (char *)wifi_config.ap.ssid, ap_ip, ap_nm);
+}
+
+static void configure_sta(void) {
+	wifi_config_t wifi_config;
+	memset(&wifi_config, 0, sizeof(wifi_config));
+
+	const char *ssid = thalow_config_get_wifi_sta_ssid();
+	const char *pw = thalow_config_get_wifi_sta_password();
+	size_t sl = strlen(ssid);
+	if (sl > 32) sl = 32;
+	memcpy(wifi_config.sta.ssid, ssid, sl);
+	size_t pl = strlen(pw);
+	if (pl > 63) pl = 63;
+	memcpy(wifi_config.sta.password, pw, pl);
+	wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+	/* Wake on EVERY beacon (each ~102 ms) instead of every 3rd. Only takes
+	 * effect under WIFI_PS_MAX_MODEM (set in wifi_apply); ignored by
+	 * MIN_MODEM (which follows the AP DTIM). Pairs with core-1 BT pin to
+	 * eliminate bcn_timeout under BT coexistence. */
+	wifi_config.sta.listen_interval = 1;
+
+	ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+
+	if (!thalow_config_get_wifi_sta_dhcp()) {
+		const char *ip = thalow_config_get_wifi_sta_ip();
+		const char *nm = thalow_config_get_wifi_sta_netmask();
+		const char *gw = thalow_config_get_wifi_sta_gw();
+		if (ip[0] != '\0' && nm[0] != '\0' && gw[0] != '\0') {
+			esp_netif_ip_info_t ip_info;
+			memset(&ip_info, 0, sizeof(ip_info));
+			if (esp_netif_str_to_ip4(ip, &ip_info.ip) != ESP_OK ||
+			    esp_netif_str_to_ip4(nm, &ip_info.netmask) != ESP_OK ||
+			    esp_netif_str_to_ip4(gw, &ip_info.gw) != ESP_OK) {
+				ESP_LOGE(TAG, "invalid static STA IP, using DHCP");
+			} else {
+				esp_netif_dhcpc_stop(sta_netif);
+				esp_netif_set_ip_info(sta_netif, &ip_info);
+				ESP_LOGI(TAG, "STA static IP %s", ip);
+			}
+		} else {
+			ESP_LOGW(TAG, "static IP requested but incomplete, DHCP");
+		}
+	} else {
+		esp_netif_dhcpc_start(sta_netif);
+		ESP_LOGI(TAG, "STA DHCP enabled");
+	}
+}
+
+esp_err_t wifi_init(void) {
+	if (!s_wifi_eg)
+		s_wifi_eg = xEventGroupCreate();
+
+	if (!s_wifi_inited) {
+		wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+		ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+		if (!handlers_registered) {
+			ESP_ERROR_CHECK(esp_event_handler_instance_register(
+				WIFI_EVENT, ESP_EVENT_ANY_ID, &on_wifi_event, NULL, NULL));
+			ESP_ERROR_CHECK(esp_event_handler_instance_register(
+				IP_EVENT, ESP_EVENT_ANY_ID, &on_wifi_event, NULL, NULL));
+			handlers_registered = true;
+		}
+		s_wifi_inited = true;
+	}
+
+	return wifi_apply();
+}
+
+esp_err_t wifi_scan(wifi_ap_record_t *out, uint16_t cap, uint16_t *count) {
+	if (!out || !count || cap == 0)
+		return ESP_ERR_INVALID_ARG;
+
+	wifi_mode_t mode;
+	esp_err_t e = esp_wifi_get_mode(&mode);
+	if (e != ESP_OK)
+		return e;
+
+	if (mode != WIFI_MODE_STA && mode != WIFI_MODE_APSTA) {
+		ESP_LOGW(TAG, "scan needs STA interface, current mode=%d", mode);
+		return ESP_ERR_WIFI_MODE;
+	}
+
+	ble_pause();
+
+	/* scan_time left at zeroed defaults: when BT coexistence is active, IDF
+	 * REQUIRES default active-scan timing. Setting a custom scan_time.active.max
+	 * triggers "Should use default active scan time parameter for WiFi scan when
+	 * Bluetooth is enabled" and produces inconsistent results (variable AP
+	 * counts scan to scan) because coex preempts the longer dwell mid-channel. */
+	wifi_scan_config_t scan_cfg = {
+		.ssid = NULL,
+		.bssid = NULL,
+		.channel = 0,
+		.show_hidden = true,
+		.scan_type = WIFI_SCAN_TYPE_ACTIVE,
+	};
+
+	e = esp_wifi_scan_start(&scan_cfg, true);
+	if (e != ESP_OK) {
+		ESP_LOGE(TAG, "esp_wifi_scan_start failed: %s", esp_err_to_name(e));
+		ble_resume();
+		return e;
+	}
+
+	uint16_t n = cap;
+	e = esp_wifi_scan_get_ap_records(&n, out);
+	if (e != ESP_OK) {
+		ESP_LOGE(TAG, "esp_wifi_scan_get_ap_records failed: %s",
+		         esp_err_to_name(e));
+		esp_wifi_clear_ap_list();
+		ble_resume();
+		return e;
+	}
+	*count = n;
+
+	/* Sort results by RSSI descending so the strongest APs appear first. */
+	for (uint16_t i = 0; i + 1 < n; i++) {
+		for (uint16_t j = i + 1; j < n; j++) {
+			if (out[j].rssi > out[i].rssi) {
+				wifi_ap_record_t t = out[i];
+				out[i] = out[j];
+				out[j] = t;
+			}
+		}
+	}
+
+	ble_resume();
+	ESP_LOGI(TAG, "scan done, %u APs found", n);
+	return ESP_OK;
+}
+
+esp_err_t wifi_get_sta_ip_info(esp_netif_ip_info_t *out) {
+	if (!out)
+		return ESP_ERR_INVALID_ARG;
+	if (!sta_netif)
+		return ESP_ERR_NOT_FOUND;
+	return esp_netif_get_ip_info(sta_netif, out);
+}
+
+esp_err_t wifi_get_ap_ip_info(esp_netif_ip_info_t *out) {
+	if (!out)
+		return ESP_ERR_INVALID_ARG;
+	if (!ap_netif)
+		return ESP_ERR_NOT_FOUND;
+	return esp_netif_get_ip_info(ap_netif, out);
+}
+esp_err_t wifi_apply(void) {
+	ESP_LOGI(TAG, "applying WiFi configuration");
+
+	bool ap_en = thalow_config_get_wifi_ap_enabled();
+	bool sta_en = thalow_config_get_wifi_sta_enabled();
+
+	if (s_wifi_inited) {
+		esp_wifi_stop();
+	}
+
+	if (!ap_en && !sta_en) {
+		ESP_LOGI(TAG, "wifi disabled");
+		if (s_wifi_inited)
+			esp_wifi_set_mode(WIFI_MODE_NULL);
+		s_sta_connected = false;
+		return ESP_OK;
+	}
+
+	if (ap_en && !ap_netif)
+		ap_netif = esp_netif_create_default_wifi_ap();
+	if ((ap_en || sta_en) && !sta_netif)
+		sta_netif = esp_netif_create_default_wifi_sta();
+
+	/* Pick the narrowest mode that covers the enabled interfaces. Selecting
+	 * APSTA when STA is off leaves the STA netif / coex machinery running
+	 * needlessly and is reported back as "APSTA" by esp_wifi_get_mode(),
+	 * which confused the stats panel into showing AP+STA after the user
+	 * disabled STA. Map each combination to the exact mode it needs. */
+	wifi_mode_t mode;
+	const char *mode_name;
+	if (ap_en && sta_en) {
+		mode = WIFI_MODE_APSTA;
+		mode_name = "APSTA";
+	} else if (ap_en) {
+		mode = WIFI_MODE_AP;
+		mode_name = "AP";
+	} else {
+		mode = WIFI_MODE_STA;
+		mode_name = "STA";
+	}
+	ESP_ERROR_CHECK(esp_wifi_set_mode(mode));
+	ESP_LOGI(TAG, "mode=%s", mode_name);
+
+	if (ap_en)
+		configure_ap();
+	if (sta_en)
+		configure_sta();
+
+	ESP_ERROR_CHECK(esp_wifi_start());
+
+	/* BT/WiFi coexistence: ESP32-S3 has a single 2.4 GHz radio shared by
+	 * software coexistence between BLE peripheral (Columba GATT link) and
+	 * APSTA. The IDF default WIFI_PS_MIN_MODEM with DTIM listen interval 3
+	 * sleeps the modem between beacons; when BLE is connected it can steal
+	 * a beacon slot -> bcn_timeout -> disconnect cycle (observed: first
+	 * "Coexist: Wi-Fi connect fail" fires ~4s after a BLE connection).
+	 *
+	 * MAX_MODEM + listen_interval=1 (set in configure_sta): modem still
+	 * sleeps between beacons (battery saving) but wakes on EVERY beacon
+	 * (102.4 ms) instead of every 3rd. With a good RSSI this holds the
+	 * link stably under BT coex. BT controller is also pinned to core 1
+	 * (see sdkconfig.defaults) so the coex arbiter has its own CPU budget.
+	 *
+	 * If this still proves unstable under heavy BLE traffic, the escalation
+	 * path is WIFI_PS_NONE (modem never sleeps, +30-50 mA), or adaptive PS
+	 * that flips to NONE only while a BLE connection is active. */
+	esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
+
+	init_mdns();
+	if (sta_en) {
+		esp_wifi_connect();
+	} else {
+		esp_wifi_disconnect();
+		s_sta_connected = false;
+	}
+
+	return ESP_OK;
+}
+
+/* Restore the previously-saved STA config after a failed interactive
+ * connect, then re-apply so the device reconnects to the network that
+ * worked before. If there was no prior STA (prev_enabled=false), STA is
+
+ * left disabled exactly as it was before the attempt. */
+
+static void rollback_sta(const char *prev_ssid, const char *prev_pass,
+                         bool prev_enabled) {
+	ESP_LOGI(TAG, "STA connect failed, rolling back to previous config");
+	thalow_config_set_wifi_sta_enabled(prev_enabled);
+	if (prev_enabled) {
+		thalow_config_set_wifi_sta_ssid(prev_ssid);
+		thalow_config_set_wifi_sta_password(prev_pass);
+	}
+	wifi_apply();
+}
+
+esp_err_t wifi_sta_connect(const char *ssid, const char *password,
+                           char *ip_out, size_t ip_sz,
+                           char *reason_out, size_t reason_sz,
+                           int timeout_ms) {
+	if (!ssid || ssid[0] == '\0')
+		return ESP_ERR_INVALID_ARG;
+	if (!s_wifi_eg)
+		return ESP_ERR_INVALID_STATE;
+	if (!password)
+		password = "";
+
+	/* Snapshot the currently-saved STA config BEFORE overwriting it. The
+
+	 * setters below commit to NVS immediately; if this connect fails we
+
+	 * restore the snapshot so the device falls back to the previously
+
+	 * working network instead of being stranded on a dead SSID. */
+
+	char prev_ssid[33];
+	char prev_pass[64];
+	bool prev_enabled;
+	strncpy(prev_ssid, thalow_config_get_wifi_sta_ssid(), sizeof(prev_ssid) - 1);
+	prev_ssid[sizeof(prev_ssid) - 1] = '\0';
+	strncpy(prev_pass, thalow_config_get_wifi_sta_password(), sizeof(prev_pass) - 1);
+	prev_pass[sizeof(prev_pass) - 1] = '\0';
+	prev_enabled = thalow_config_get_wifi_sta_enabled();
+
+	thalow_config_set_wifi_sta_enabled(true);
+	thalow_config_set_wifi_sta_ssid(ssid);
+	thalow_config_set_wifi_sta_password(password);
+
+	wifi_config_t cfg;
+	memset(&cfg, 0, sizeof(cfg));
+	size_t sl = strlen(ssid);
+	if (sl > 32) sl = 32;
+	memcpy(cfg.sta.ssid, ssid, sl);
+	size_t pl = strlen(password);
+	if (pl > 63) pl = 63;
+	memcpy(cfg.sta.password, password, pl);
+	cfg.sta.threshold.authmode = (pl > 0) ? WIFI_AUTH_WPA2_PSK
+	                                       : WIFI_AUTH_OPEN;
+	cfg.sta.listen_interval = 1;  /* match configure_sta; see comment there */
+
+	esp_err_t e = esp_wifi_set_config(WIFI_IF_STA, &cfg);
+	if (e != ESP_OK) {
+		ESP_LOGE(TAG, "set STA config failed: %s", esp_err_to_name(e));
+		return e;
+	}
+
+	xEventGroupClearBits(s_wifi_eg, STA_CONNECTED_BIT | STA_FAIL_BIT);
+	s_fail_reason[0] = '\0';
+	s_got_ip[0] = '\0';
+	s_connect_tries = 0;
+	s_connect_pending = true;
+
+	esp_wifi_disconnect();
+	e = esp_wifi_connect();
+	/* ESP_ERR_WIFI_CONN here means a connect is already in flight: the
+	 * STA_DISCONNECTED event fired by our esp_wifi_disconnect() above was
+	 * picked up by on_wifi_event(), which — seeing s_connect_pending=true
+	 * — already called esp_wifi_connect() before us. That in-flight connect
+	 * will set the result bits, so don't abort; just proceed to wait. */
+	if (e != ESP_OK && e != ESP_ERR_WIFI_CONN) {
+		s_connect_pending = false;
+		ESP_LOGE(TAG, "esp_wifi_connect failed: %s", esp_err_to_name(e));
+		return e;
+	}
+
+	ESP_LOGI(TAG, "connecting STA to '%s'...", ssid);
+	EventBits_t bits = xEventGroupWaitBits(
+		s_wifi_eg, STA_CONNECTED_BIT | STA_FAIL_BIT,
+		pdFALSE, pdFALSE, pdMS_TO_TICKS(timeout_ms));
+	s_connect_pending = false;
+
+	if (bits & STA_CONNECTED_BIT) {
+		if (ip_out && ip_sz)
+			strlcpy(ip_out, s_got_ip, ip_sz);
+		ESP_LOGI(TAG, "STA connected, IP=%s", s_got_ip);
+		return ESP_OK;
+	}
+	if (bits & STA_FAIL_BIT) {
+		if (reason_out && reason_sz)
+			strlcpy(reason_out, s_fail_reason, reason_sz);
+		rollback_sta(prev_ssid, prev_pass, prev_enabled);
+		return ESP_FAIL;
+	}
+
+	if (reason_out && reason_sz)
+		strlcpy(reason_out, "Connection timeout", reason_sz);
+	ESP_LOGW(TAG, "STA connect timeout");
+	rollback_sta(prev_ssid, prev_pass, prev_enabled);
+	return ESP_ERR_TIMEOUT;
+}
+
+bool wifi_sta_connected(void) {
+	return s_sta_connected;
+}
+
+int wifi_ap_station_count(void) {
+	return s_ap_sta_count;
+}
+
+const char *wifi_sta_status(void) {
+	if (s_connect_pending)
+		return "connecting";
+	if (s_sta_connected)
+		return "connected";
+	if (s_sta_failed)
+		return "failed";
+	if (!thalow_config_get_wifi_sta_enabled())
+		return "idle";
+	/* Enabled but neither connected nor marked failed and no pending
+	 * attempt — most likely mid-background-retry. Surface as connecting. */
+	return s_wifi_inited ? "connecting" : "idle";
+}
+
+int32_t wifi_sta_rssi(void) {
+	if (!s_sta_connected)
+		return INT32_MIN;
+	wifi_ap_record_t ap;
+	if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK)
+		return INT32_MIN;
+	return ap.rssi;
+}
+
+const char *wifi_sta_configured_ssid(void) {
+	return thalow_config_get_wifi_sta_ssid();
+}
+
+const char *wifi_get_hostname(void) {
+	if (!s_mdns_inited || s_mdns_host[0] == '\0')
+		return "";
+	static char full[48];
+	snprintf(full, sizeof(full), "%s.local", s_mdns_host);
+	return full;
+}
