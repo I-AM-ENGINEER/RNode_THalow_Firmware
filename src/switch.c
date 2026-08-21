@@ -201,10 +201,18 @@ void switch_init(void) {
 	inited = true;
 
 	for (int i = 0; i < 3; i++) {
-		s_rings[i].slots = heap_caps_malloc(sizeof(sw_slot_t) * SW_RING_SIZE,
+		size_t ring_bytes = sizeof(sw_slot_t) * SW_RING_SIZE;
+		s_rings[i].slots = heap_caps_malloc(ring_bytes,
 		                                    MALLOC_CAP_SPIRAM);
 		if (!s_rings[i].slots) {
-			ESP_LOGE(TAG, "PSRAM alloc failed for ring %d", i);
+			/* No PSRAM (or exhausted): fall back to internal RAM so the
+			 * switch still works on PSRAM-less boards / QEMU. */
+			s_rings[i].slots = heap_caps_malloc(ring_bytes,
+			                                    MALLOC_CAP_8BIT);
+		}
+		if (!s_rings[i].slots) {
+			ESP_LOGE(TAG, "ring %d alloc failed (%u bytes)",
+			         i, (unsigned)ring_bytes);
 			return;
 		}
 		s_rings[i].mu      = xSemaphoreCreateMutex();

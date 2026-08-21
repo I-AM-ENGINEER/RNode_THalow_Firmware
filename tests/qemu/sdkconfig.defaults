@@ -1,0 +1,9 @@
+CONFIG_IDF_TARGET="esp32s3"
+# Minimal periphery: no WiFi/BLE radio init in these tests (components are
+# still compiled in IDF but never started), keeps QEMU boot fast and quiet.
+CONFIG_ESP_WIFI_ENABLED=n
+CONFIG_BT_ENABLED=n
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_FREERTOS_HZ=1000
+# QEMU's esp32s3 machine models the octal PSRAM (-m size), so production
+# code paths that require MALLOC_CAP_SPIRAM behave like on real hardware.

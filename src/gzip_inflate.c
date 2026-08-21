@@ -303,9 +303,8 @@ int gzip_inflate(const uint8_t *src, size_t src_len,
 			break;
 	}
 
-	if (s.error)
-		return -1;
-
+	/* Always report how many bytes were produced, even on failure -- the
+	 * prefix written before the error is valid data. */
 	*out_len = s.out_len;
-	return 0;
+	return s.error ? -1 : 0;
 }

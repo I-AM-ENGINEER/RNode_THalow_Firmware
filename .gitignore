@@ -41,3 +41,10 @@ tests/*.exe
 tests/test_rns_framing
 tests/test_kiss
 tests/test_dns_overflow
+
+# Test artifacts
+tests/qemu/build/
+tests/qemu/sdkconfig
+tests/qemu/sdkconfig.old
+tests/qemu/*.log
+.pytest_cache/
