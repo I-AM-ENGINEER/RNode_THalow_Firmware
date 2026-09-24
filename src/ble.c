@@ -98,6 +98,14 @@ static uint16_t tx_handle;
 static ble_state_t ble_state = BLE_STATE_OFF;
 static bool allow_pairing = false;
 
+/* Pairing gate: outside the pairing window, advertising is filtered by the
+ * controller whitelist (rebuilt from the NVS bond store). Only bonded peers
+ * may connect at all, so no new pairing can happen unless the BOOT button
+ * opened the window. A side effect of the filter policy: non-bonded
+ * scanners do not get the scan response either, so the device shows up
+ * unnamed for strangers (columba's wizard lists named RNodes only). */
+static bool s_phy_requested = false; /* one 2M PHY request per connection */
+
 /* Two-phase advertising. After boot / disconnect / pairing-enabled, we do a
  * FAST burst (<=40 ms interval) so Android/iOS system Bluetooth scanners can
  * discover the device within ~1 second (BLE Core Spec Vol 3, Part C, 9.3).
@@ -131,6 +139,29 @@ static uint32_t s_notify_fail = 0;
 static uint32_t s_auth_reject = 0;
 
 static void ble_advertise( void );
+
+/* Rebuild the controller whitelist from the persisted bond identities.
+ * Called right before every advertising (re)start while the pairing gate
+ * is active. MAX_BONDS is 3; 8 slots is generous headroom. */
+static void ble_whitelist_refresh( void ) {
+	ble_addr_t ids[8];
+	int count = 0;
+
+	int rc = ble_store_util_bonded_peers(ids, &count,
+	                                     (int)(sizeof(ids) / sizeof(ids[0])));
+	if (rc != 0) {
+		ESP_LOGW(TAG, "bonded_peers read failed: %d", rc);
+		return;
+	}
+
+	rc = ble_gap_wl_set(ids, (uint8_t)count);
+	if (rc != 0) {
+		ESP_LOGW(TAG, "whitelist set failed: rc=%d (count=%d)", rc, count);
+		return;
+	}
+
+	ESP_LOGI(TAG, "pairing gate: whitelist = %d bonded peer(s)", count);
+}
 
 /* ------------------------------------------------------------------ */
 /* GATT                                                               */
@@ -281,6 +312,17 @@ static void ble_advertise( void ) {
 	adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;
 	adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
 
+	if (allow_pairing) {
+		/* Pairing window open: anyone may discover, scan and connect. */
+		adv_params.filter_policy = BLE_HCI_ADV_FILT_NONE;
+	} else {
+		/* Gate closed: only bonded peers may connect (and only they get
+		 * the scan response with the name). The whitelist is refreshed
+		 * from the bond store right before the advertising start. */
+		ble_whitelist_refresh();
+		adv_params.filter_policy = BLE_HCI_ADV_FILT_SCAN;
+	}
+
 	int32_t duration_ms;
 	if (s_adv_fast) {
 		adv_params.itvl_min = BLE_ADV_FAST_MIN;
@@ -336,6 +378,7 @@ static int gap_event_cb( struct ble_gap_event *event, void *arg ) {
 		active_conn = event->connect.conn_handle;
 		conn_encrypted = false;
 		tx_subscribed = false;
+		s_phy_requested = false;
 		ble_state = BLE_STATE_ON;
 		ESP_LOGI(TAG, "connected (handle %u)", active_conn);
 		/* No LL procedures here. Encryption/param/PHY sequencing happens
@@ -352,6 +395,7 @@ static int gap_event_cb( struct ble_gap_event *event, void *arg ) {
 		active_conn = BLE_HS_CONN_HANDLE_NONE;
 		conn_encrypted = false;
 		tx_subscribed = false;
+		s_phy_requested = false;
 		/* If the pairing window is still open, keep advertising in
 		 * pairing mode so the user can retry within the window. */
 		ble_state = allow_pairing ? BLE_STATE_PAIRING : BLE_STATE_ON;
@@ -413,9 +457,12 @@ static int gap_event_cb( struct ble_gap_event *event, void *arg ) {
 		         desc.conn_itvl * 1250, desc.conn_latency,
 		         desc.supervision_timeout * 10, event->conn_update.status);
 		/* Param update finished -> now (and only now) request the 2M PHY.
-		 * One LL procedure at a time. Failures are harmless (1M PHY works
-		 * fine) and are only logged. */
-		if (conn_encrypted && active_conn != BLE_HS_CONN_HANDLE_NONE) {
+		 * One LL procedure at a time, and only once per connection (some
+		 * centrals issue several conn updates in a row). Failures are
+		 * harmless (1M PHY works fine) and are only logged. */
+		if (!s_phy_requested && conn_encrypted &&
+		    active_conn != BLE_HS_CONN_HANDLE_NONE) {
+			s_phy_requested = true;
 			int rc = ble_gap_set_prefered_le_phy(active_conn,
 				BLE_GAP_LE_PHY_2M_MASK, BLE_GAP_LE_PHY_2M_MASK,
 				BLE_GAP_LE_PHY_CODED_ANY);
@@ -525,6 +572,7 @@ static void on_reset( int reason ) {
 	active_conn = BLE_HS_CONN_HANDLE_NONE;
 	conn_encrypted = false;
 	tx_subscribed = false;
+	s_phy_requested = false;
 }
 
 static void host_task( void *param ) {
@@ -625,10 +673,18 @@ void ble_enable_pairing( void ) {
 }
 
 void ble_disable_pairing( void ) {
+	bool was_open = allow_pairing;
 	allow_pairing = false;
 	if (ble_state == BLE_STATE_PAIRING)
 		ble_state = BLE_STATE_ON;
 	ESP_LOGI(TAG, "pairing window closed");
+	/* Switch advertising back to the bonded-only gate. Restarting while
+	 * connected just fails harmlessly (can't advertise while connected);
+	 * the DISCONNECT handler will restart in gated mode. */
+	if (was_open && ble_hs_synced() && active_conn == BLE_HS_CONN_HANDLE_NONE) {
+		ble_gap_adv_stop();
+		ble_advertise();
+	}
 }
 
 ble_state_t ble_get_state( void ) {
