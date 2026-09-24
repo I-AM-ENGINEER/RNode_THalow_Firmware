@@ -9,9 +9,11 @@ extern "C" {
 #endif
 
 /* Max size of a KISS frame payload (NOT counting the KISS command byte,
- * FEND framing or escaping). Must be >= RNS_FRAMING_MAX_PACKET (1024) so a
- * full RNS packet can round-trip through KISS without truncation. */
-#define KISS_FRAME_MAX (1024)
+ * FEND framing or escaping). rx_frame holds the command byte PLUS the
+ * payload, so this must be >= RNS_FRAMING_MAX_PACKET (1024) + 1; the old
+ * value of exactly 1024 silently truncated every full-size RNS packet by
+ * its last byte. +7 margin. */
+#define KISS_FRAME_MAX (1032)
 
 typedef void (*kiss_tx_cb)( void *user, const uint8_t *buf, size_t len );
 typedef void (*kiss_data_cb)( void *user, const uint8_t *data, size_t len );
@@ -25,6 +27,11 @@ typedef struct kiss {
 	int           rx_len;
 	bool          in_frame;
 	bool          escape;
+	/* Set when an incoming frame exceeds rx_frame: the frame is dropped
+	 * whole (never delivered truncated) and bytes are discarded until the
+	 * next FEND so the stream resynchronizes on a frame boundary. */
+	bool          rx_overflow;
+	uint32_t      rx_dropped;
 } kiss_t;
 
 /* Initialize a KISS instance bound to a TX transport. @k must point to

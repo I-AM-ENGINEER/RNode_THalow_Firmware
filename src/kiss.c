@@ -1,6 +1,9 @@
 #include <string.h>
 #include <stdbool.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+
 #include "kiss.h"
 
 #define FEND              0xC0
@@ -43,30 +46,43 @@
 #define FW_MAJOR          0x01
 #define FW_MINOR          0x59
 
+/* Frame-building scratch. send_kiss can be reached from two tasks (the
+ * switch dispatch task via kiss_send_data, and the BLE RX task via the
+ * config-echo path in handle_frame), so the scratch is static and guarded
+ * by a mutex instead of a ~2 KB stack frame inside a 4 KB task. */
+static uint8_t tx_scratch[KISS_FRAME_MAX * 2 + 8];
+static SemaphoreHandle_t tx_scratch_lock;
+
 static void send_kiss( kiss_t *k, uint8_t cmd, const uint8_t *data, int len ) {
 	/* Worst-case frame size: every payload byte escaped (2 bytes each) +
 	 * FEND + cmd + trailing FEND = 2*len + 4. Allocated generously. */
-	uint8_t buf[KISS_FRAME_MAX * 2 + 8];
+	if (tx_scratch_lock == NULL)
+		tx_scratch_lock = xSemaphoreCreateMutex();
+
+	xSemaphoreTake(tx_scratch_lock, portMAX_DELAY);
+
 	int pos = 0;
 
-	buf[pos++] = FEND;
-	buf[pos++] = cmd;
+	tx_scratch[pos++] = FEND;
+	tx_scratch[pos++] = cmd;
 
 	for (int i = 0; i < len; i++) {
 		if (data[i] == FEND) {
-			buf[pos++] = FESC;
-			buf[pos++] = TFEND;
+			tx_scratch[pos++] = FESC;
+			tx_scratch[pos++] = TFEND;
 		} else if (data[i] == FESC) {
-			buf[pos++] = FESC;
-			buf[pos++] = TFESC;
+			tx_scratch[pos++] = FESC;
+			tx_scratch[pos++] = TFESC;
 		} else {
-			buf[pos++] = data[i];
+			tx_scratch[pos++] = data[i];
 		}
 	}
 
-	buf[pos++] = FEND;
+	tx_scratch[pos++] = FEND;
 	if (k->tx_cb)
-		k->tx_cb(k->tx_user, buf, pos);
+		k->tx_cb(k->tx_user, tx_scratch, pos);
+
+	xSemaphoreGive(tx_scratch_lock);
 }
 
 static void handle_frame( kiss_t *k, const uint8_t *frame, int len ) {
@@ -173,6 +189,8 @@ void kiss_init( kiss_t *k, kiss_tx_cb tx_cb, void *tx_user ) {
 	k->rx_len   = 0;
 	k->in_frame = false;
 	k->escape   = false;
+	k->rx_overflow = false;
+	k->rx_dropped  = 0;
 }
 
 void kiss_set_data_callback( kiss_t *k, kiss_data_cb cb, void *user ) {
@@ -185,8 +203,14 @@ void kiss_rx_byte( kiss_t *k, uint8_t b ) {
 		return;
 
 	if (b == FEND) {
-		if (k->in_frame && k->rx_len > 0)
+		if (k->rx_overflow) {
+			/* Frame boundary reached: resume normal reception. The
+			 * oversized frame is NOT delivered -- a silently truncated
+			 * frame is worse than a dropped one (KISS has no CRC). */
+			k->rx_overflow = false;
+		} else if (k->in_frame && k->rx_len > 0) {
 			handle_frame(k, k->rx_frame, k->rx_len);
+		}
 		k->in_frame = true;
 		k->escape = false;
 		k->rx_len = 0;
@@ -195,6 +219,9 @@ void kiss_rx_byte( kiss_t *k, uint8_t b ) {
 
 	if (!k->in_frame)
 		return;
+
+	if (k->rx_overflow)
+		return; /* discard until the next FEND */
 
 	if (b == FESC) {
 		k->escape = true;
@@ -207,8 +234,13 @@ void kiss_rx_byte( kiss_t *k, uint8_t b ) {
 		k->escape = false;
 	}
 
-	if (k->rx_len < KISS_FRAME_MAX)
+	if (k->rx_len < KISS_FRAME_MAX) {
 		k->rx_frame[k->rx_len++] = b;
+	} else {
+		k->rx_overflow = true;
+		k->rx_dropped++;
+		k->escape = false;
+	}
 }
 
 void kiss_send_data( kiss_t *k, const uint8_t *data, size_t len ) {

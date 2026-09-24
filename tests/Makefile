@@ -20,6 +20,12 @@ test_switch_ring: test_switch_ring.c ../src/switch.c \
                   stub/freertos/FreeRTOS.h freertos_host_mock.h
 	$(CC) $(CFLAGS) -I. -Istub -I../inc -o $@ test_switch_ring.c
 
+# Compiles the REAL src/kiss.c (which needs the FreeRTOS mutex shim from
+# tests/stub) so these tests cannot drift from the firmware.
+test_kiss: test_kiss.c ../src/kiss.c \
+           stub/freertos/FreeRTOS.h freertos_host_mock.h
+	$(CC) $(CFLAGS) -I. -Istub -I../inc -o $@ test_kiss.c ../src/kiss.c
+
 %: %.c
 	$(CC) $(CFLAGS) -o $@ $<
 

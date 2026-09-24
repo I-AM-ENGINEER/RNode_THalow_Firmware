@@ -48,19 +48,28 @@ extern "C" {
 #define RNS_PROXY_IDLE_TIMEOUT_MS (120000)
 #define RNS_PROXY_BUF_SZ          (1024)
 
-/* --- BLE (Nordic UART Service, NimBLE) --- */
+/* --- BLE (Nordic UART Service, NimBLE) ---
+ * Security: Just Works + bonding + Secure Connections; the data plane is
+ * encrypted-only (see src/ble.c and docs/ble-analysis.md). Pairing needs
+ * no passkey on any platform (columba auto-confirms, bluetoothctl pairs
+ * silently for python RNS). BLE_PAIRING_TIMEOUT is the UX window opened
+ * by the BOOT button (fast advertising + LED); it is not a hard SMP gate. */
 #define BLE_DEVICE_NAME      "RNode HaLow"
-#define BLE_PASSKEY          (123456)
 #define BLE_PAIRING_TIMEOUT  (35000)
 
 /* --- BLE advertising (two-phase) ---
  * After boot / disconnect / pairing-enabled, the device does a burst of FAST
  * advertising so Android/iOS scanners in the system Bluetooth settings can
  * discover and pair within ~1 second. After the burst, it drops to SLOW
- * advertising to save power (roughly 5-10x lower RF duty cycle).
+ * advertising to save power.
  *
  * Fast interval:   32..64   units of 0.625 ms = 20..40 ms   (~25-50 Hz)
- * Slow interval:   2048..2560 units of 0.625 ms = 1280..1600 ms (~0.7 Hz)
+ * Slow interval:   256..400 units of 0.625 ms = 160..250 ms (~4-6 Hz)
+ *
+ * The slow interval is deliberately NOT the old 1.3-1.6 s: bleak's BLE
+ * discovery (python Reticulum) scans in 2 s windows and Android direct
+ * connects need reasonably frequent adverts; 160-250 ms keeps discovery
+ * reliable while still ~4x lower duty cycle than the fast burst.
  *
  * The fast burst runs for BLE_ADV_FAST_MS. Android's system scanner
  * implements match filtering on the controller; at >100 ms intervals it
@@ -70,8 +79,8 @@ extern "C" {
 #define BLE_ADV_FAST_MS     (30000)
 #define BLE_ADV_FAST_MIN    (32)
 #define BLE_ADV_FAST_MAX    (64)
-#define BLE_ADV_SLOW_MIN    (2048)
-#define BLE_ADV_SLOW_MAX    (2560)
+#define BLE_ADV_SLOW_MIN    (256)
+#define BLE_ADV_SLOW_MAX    (400)
 
 /* --- Status LED + BOOT button --- */
 #define LED_PIN              (38)

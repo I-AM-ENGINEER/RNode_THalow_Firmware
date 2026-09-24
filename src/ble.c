@@ -21,24 +21,53 @@
 
 void ble_store_config_init( void );
 
+/* IDF 5.4.4 does not yet contain the upstream "remove before add" fix in
+ * ble_hs_pvcy.c. Re-pairing a peer whose identity is already in the
+ * controller resolving list fails with HCI error 0x12/0x212 on
+ * LE Add Device To Resolving List, and that error propagates into SMP and
+ * kills the pairing. We clear the stale entry ourselves in the
+ * REPEAT_PAIRING handler. Internal NimBLE helper, stable signature. */
+extern int ble_hs_pvcy_remove_entry( uint8_t addr_type, const uint8_t *addr );
+
 #include "ble.h"
 #include "thalow_config.h"
 #include "config/project_config.h"
 
 static const char *TAG = "ble";
 
+/* ------------------------------------------------------------------ */
+/* Design notes (full analysis: docs/ble-analysis.md)                  */
+/*                                                                     */
+/* Security model: Just Works + bonding + Secure Connections. The old  */
+/* static-passkey MITM posture protected nothing (public constant      */
+/* passkey == Just Works) while breaking headless clients: python RNS   */
+/* has no pairing agent, and our terminate-during-pairing made Android */
+/* delete its bond ("device disappears from saved devices"). Data is   */
+/* still encrypted-only: RX writes return INSUFFICIENT_AUTHEN until    */
+/* the link is encrypted, notifications are withheld until encrypted.  */
+/*                                                                     */
+/* Bonding: keys distributed are ENC|ID in BOTH directions. With SC the */
+/* ENC bit is stripped by NimBLE anyway; what matters is ID (IRK +      */
+/* identity address) so the bond is stored under the peer's IDENTITY   */
+/* address and the controller resolving list can resolve the central's */
+/* rotating RPA after a reboot. This is the root-cause fix for         */
+/* "pairing does not survive reboot".                                  */
+/* ------------------------------------------------------------------ */
+
 #define RX_STREAM_SIZE   (2048)
 /* TX buffer: must hold a full worst-case KISS frame. KISS escaping can
  * double every payload byte (FEND/FESC -> 2 bytes), so a 1024-byte RNS
- * payload becomes up to 2*1024 + cmd + 2*FEND ~= 2052 bytes. */
+ * payload becomes up to 2*1024 + cmd + 2*FEND ~= 2052 bytes. Write policy
+ * is frame-atomic: a frame is either fully buffered or fully dropped. */
 #define TX_BUFFER_SIZE   (2064)
-/* Max payload of a single GATT Write Request. Limited by the negotiated
- * MTU (att_mtu - 3 header); 512 is the NimBLE max. Decoupled from
- * TX_BUFFER_SIZE so the GATT access callback doesn't burn 2 KB of
- * NimBLE host-task stack. */
+/* Max payload of a single GATT Write Request, bounded by the negotiated
+ * ATT MTU (mtu-3). Static scratch instead of a stack buffer so the NimBLE
+ * host task (which runs this callback) does not burn 512 bytes of stack. */
 #define BLE_GATT_WRITE_MAX (512)
-#define BLE_NOTIFY_MAX   (250)
-#define STATUS_TASK_MS   (10)
+/* Cap for a single notification chunk: mtu-3 clamped to 509. */
+#define BLE_NOTIFY_MAX   (509)
+#define FLUSH_PERIOD_MS  (10)
+#define KISS_FEND        (0xC0)
 
 /* Nordic UART Service UUIDs (little-endian byte order) */
 /* 6e400001-b5a3-f393-e0a9-e50e24dcca9e */
@@ -59,7 +88,10 @@ static const ble_uuid128_t nus_tx_uuid = BLE_UUID128_INIT(
 static uint8_t own_addr_type;
 static char s_device_name[40];
 static uint16_t active_conn = BLE_HS_CONN_HANDLE_NONE;
-static bool tx_subscribed = false;
+/* CCCD subscribed (client wants notifications). Data only flows when the
+ * link is also encrypted. */
+static volatile bool tx_subscribed = false;
+static volatile bool conn_encrypted = false;
 static uint16_t rx_handle;
 static uint16_t tx_handle;
 
@@ -68,46 +100,97 @@ static bool allow_pairing = false;
 
 /* Two-phase advertising. After boot / disconnect / pairing-enabled, we do a
  * FAST burst (<=40 ms interval) so Android/iOS system Bluetooth scanners can
- * discover the device within ~1 second. After BLE_ADV_FAST_MS we drop to SLOW
- * (~1.3-1.6 s interval) to save power. See BLE Core Spec Vol 3, Part C, 9.3
- * "Connection Establishment" -- fast interval is explicitly recommended for
- * the discovery phase. */
+ * discover the device within ~1 second (BLE Core Spec Vol 3, Part C, 9.3).
+ * After BLE_ADV_FAST_MS we drop to SLOW (~160-250 ms): still comfortably
+ * discoverable inside bleak's 2 s scan window and fast for Android direct
+ * connects, but ~4x lower RF duty cycle than the fast burst. */
 static bool s_adv_fast = true;
-/* True while BLE is paused for a WiFi scan (advertising stopped). */
-static bool s_ble_paused = false;
+/* Pause depth for WiFi scans (>0 = advertising stopped). Depth-counted so
+ * nested/concurrent scans cannot accidentally resume early. */
+static uint8_t s_ble_pause_depth = 0;
 
 static StreamBufferHandle_t rx_stream;
 static SemaphoreHandle_t tx_mutex;
 static uint8_t tx_buf[TX_BUFFER_SIZE];
 static size_t tx_buf_len = 0;
 
+/* Scratch for flattening a GATT write mbuf; only touched from the NimBLE
+ * host task (access callback), so no extra locking needed. */
+static uint8_t wr_scratch[BLE_GATT_WRITE_MAX];
+
+/* RX overflow recovery: once the stream is full we drop bytes until the
+ * next KISS FEND so the parser resynchronizes on a frame boundary instead
+ * of consuming a corrupted mid-frame tail. */
+static bool s_rx_resync = false;
+
+/* Light-weight stats, logged occasionally so silent data loss is visible. */
+static uint32_t s_tx_frames_dropped = 0;
+static uint32_t s_tx_drop_nosub = 0;
+static uint32_t s_rx_drop_bytes = 0;
+static uint32_t s_notify_fail = 0;
+static uint32_t s_auth_reject = 0;
+
+static void ble_advertise( void );
+
 /* ------------------------------------------------------------------ */
 /* GATT                                                               */
 /* ------------------------------------------------------------------ */
+
+/* Push transport bytes toward the KISS parser, dropping whole frame tails
+ * (never a silent mid-frame splice) when the stream is full. */
+static void rx_stream_send( const uint8_t *data, size_t len ) {
+	if (s_rx_resync) {
+		const uint8_t *fend = memchr(data, KISS_FEND, len);
+		if (fend == NULL) {
+			s_rx_drop_bytes += len;
+			return;
+		}
+		s_rx_drop_bytes += (size_t)(fend - data) + 1;
+		len   -= (size_t)(fend - data) + 1;
+		data  += (size_t)(fend - data) + 1;
+		s_rx_resync = false;
+		if (len == 0)
+			return;
+	}
+
+	size_t space = xStreamBufferSpacesAvailable(rx_stream);
+	if (len > space) {
+		s_rx_resync = true;
+		s_rx_drop_bytes += len - space;
+		len = space;
+		ESP_LOGW(TAG, "rx stream full, dropping frame tail (+resync), total dropped %lu bytes",
+		         (unsigned long)s_rx_drop_bytes);
+	}
+	if (len > 0)
+		xStreamBufferSend(rx_stream, data, len, 0);
+}
 
 static int gatt_access_cb( uint16_t conn, uint16_t attr,
                            struct ble_gatt_access_ctxt *ctxt, void *arg ) {
 	(void)attr;
 	(void)arg;
 
-	if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
-		struct ble_gap_conn_desc desc;
-		if (ble_gap_conn_find(conn, &desc) != 0 ||
-		    !desc.sec_state.encrypted ||
-		    !desc.sec_state.authenticated) {
-			return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
-		}
+	if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR)
+		return 0;
 
-		uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
-		if (len > BLE_GATT_WRITE_MAX)
-			len = BLE_GATT_WRITE_MAX;
-
-		uint8_t tmp[BLE_GATT_WRITE_MAX];
-		ble_hs_mbuf_to_flat(ctxt->om, tmp, sizeof(tmp), &len);
-		ESP_LOGD(TAG, "rx write %u bytes", len);
-		xStreamBufferSend(rx_stream, tmp, len, 0);
+	/* Data plane is encrypted-only. Returning INSUFFICIENT_AUTHEN makes a
+	 * bonded central start encryption (or an unbonded one start pairing)
+	 * automatically -- the standard ATT security-elevation path. */
+	struct ble_gap_conn_desc desc;
+	if (ble_gap_conn_find(conn, &desc) != 0 || !desc.sec_state.encrypted) {
+		s_auth_reject++;
+		ESP_LOGW(TAG, "write rejected on unencrypted link (count %lu)",
+		         (unsigned long)s_auth_reject);
+		return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
 	}
 
+	uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
+	if (len > BLE_GATT_WRITE_MAX)
+		len = BLE_GATT_WRITE_MAX;
+
+	ble_hs_mbuf_to_flat(ctxt->om, wr_scratch, sizeof(wr_scratch), &len);
+	ESP_LOGD(TAG, "rx write %u bytes", len);
+	rx_stream_send(wr_scratch, len);
 	return 0;
 }
 
@@ -117,6 +200,8 @@ static const struct ble_gatt_svc_def gatt_svcs[] = {
 		.uuid = &nus_svc_uuid.u,
 		.characteristics = (struct ble_gatt_chr_def[]) {
 			{
+				/* Both write modes: columba writes WITH response,
+				 * python RNS/bleak writes WITHOUT response. */
 				.uuid = &nus_rx_uuid.u,
 				.access_cb = gatt_access_cb,
 				.flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
@@ -157,7 +242,9 @@ static void ble_advertise( void ) {
 	struct ble_gap_adv_params adv_params;
 	int rc;
 
-	/* Advertising data: flags + 128-bit NUS service UUID */
+	/* Advertising data: flags + 128-bit NUS service UUID. The UUID MUST be
+	 * here (not just in the GATT table): columba's ScanFilter and bleak's
+	 * discovery both match on advertised service UUIDs. */
 	memset(&fields, 0, sizeof(fields));
 	fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
 	fields.uuids128 = (ble_uuid128_t[]) {
@@ -174,7 +261,8 @@ static void ble_advertise( void ) {
 		return;
 	}
 
-	/* Scan response: always include the device name. */
+	/* Scan response: device name. Both clients require the advertised name
+	 * to start with "RNode " (the configured default name does). */
 	memset(&rsp, 0, sizeof(rsp));
 	{
 		const char *name = ble_svc_gap_device_name();
@@ -193,9 +281,6 @@ static void ble_advertise( void ) {
 	adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;
 	adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
 
-	/* Two-phase advertising. Fast burst right after boot/disconnect/pairing
-	 * so phones in Bluetooth settings see the device quickly; drops to a
-	 * slow interval for power saving afterwards. */
 	int32_t duration_ms;
 	if (s_adv_fast) {
 		adv_params.itvl_min = BLE_ADV_FAST_MIN;
@@ -210,7 +295,8 @@ static void ble_advertise( void ) {
 	rc = ble_gap_adv_start(own_addr_type, NULL, duration_ms,
 	                       &adv_params, gap_event_cb, NULL);
 	if (rc != 0) {
-		ESP_LOGE(TAG, "adv_start failed: %d", rc);
+		/* Most common cause: advertising already active. Not fatal. */
+		ESP_LOGW(TAG, "adv_start rc=%d (already active?)", rc);
 		return;
 	}
 
@@ -222,6 +308,18 @@ static void ble_advertise( void ) {
 /* GAP events                                                         */
 /* ------------------------------------------------------------------ */
 
+static const char *hci_reason_str( int reason ) {
+	switch (reason) {
+	case 0x08: return "conn timeout (supervision)";
+	case 0x0d: return "peer closed cleanly";
+	case 0x13: return "peer low resources";
+	case 0x14: return "peer power off";
+	case 0x16: return "local host terminated";
+	case 0x3e: return "conn fail to establish";
+	default:   return "other";
+	}
+}
+
 static int gap_event_cb( struct ble_gap_event *event, void *arg ) {
 	(void)arg;
 	struct ble_gap_conn_desc desc;
@@ -231,52 +329,46 @@ static int gap_event_cb( struct ble_gap_event *event, void *arg ) {
 	case BLE_GAP_EVENT_CONNECT:
 		if (event->connect.status != 0) {
 			ESP_LOGW(TAG, "connect failed: status=%d", event->connect.status);
-			s_adv_fast = true; /* give the next scan a fresh fast window */
+			s_adv_fast = true;
 			ble_advertise();
 			return 0;
 		}
 		active_conn = event->connect.conn_handle;
-		ble_state = BLE_STATE_ON;
-		ESP_LOGI(TAG, "connected (handle %u, status=%d)",
-		         active_conn, event->connect.status);
-
-		/* PHY update + param update are deferred to BLE_GAP_EVENT_ENC_CHANGE.
-		 * Scheduling them here, before SMP pairing completes, races the
-		 * controller's LL procedures against the pairing procedure and on
-		 * some centrals (notably Android) causes a proc-collision -> link
-		 * drop shortly after "encrypted + authenticated". Doing them after
-		 * encryption is the recommended NimBLE pattern. */
-		return 0;
-
-	case BLE_GAP_EVENT_DISCONNECT:
-		/* event->disconnect.reason is the HCI error code from the controller.
-		 * Common ones:
-		 *   8 (CONN_TIMEOUT) -- supervision timeout (link faded out)
-		 *  13 (REMOTE_USER_TERM) -- peer closed cleanly
-		 *  19 (REMOTE_DEV_LOW_RESOURCES) / 20 (POWER_OFF) -- peer died
-		 *  22 (LOCAL_HOST_TERM) -- we terminated
-		 *  62 (CONN_FAIL_ESTABLISH) -- connection never really came up
-		 */
-		ESP_LOGW(TAG, "disconnected (handle %u, reason=%d) conn_handle=%u",
-		         event->disconnect.conn.conn_handle,
-		         event->disconnect.reason,
-		         event->disconnect.conn.conn_handle);
-		active_conn = BLE_HS_CONN_HANDLE_NONE;
+		conn_encrypted = false;
 		tx_subscribed = false;
 		ble_state = BLE_STATE_ON;
+		ESP_LOGI(TAG, "connected (handle %u)", active_conn);
+		/* No LL procedures here. Encryption/param/PHY sequencing happens
+		 * on ENC_CHANGE / CONN_UPDATE -- starting procedures before SMP
+		 * finishes is the historical cause of post-pairing disconnects
+		 * on Android (procedure collision). */
+		return 0;
+
+	case BLE_GAP_EVENT_DISCONNECT: {
+		int reason = event->disconnect.reason;
+		ESP_LOGW(TAG, "disconnected (handle %u, reason=%d/%s)",
+		         event->disconnect.conn.conn_handle, reason,
+		         hci_reason_str(reason));
+		active_conn = BLE_HS_CONN_HANDLE_NONE;
+		conn_encrypted = false;
+		tx_subscribed = false;
+		/* If the pairing window is still open, keep advertising in
+		 * pairing mode so the user can retry within the window. */
+		ble_state = allow_pairing ? BLE_STATE_PAIRING : BLE_STATE_ON;
 		s_adv_fast = true; /* make us discoverable again right after a drop */
-		if (!s_ble_paused)
+		if (s_ble_pause_depth == 0)
 			ble_advertise();
 		else
 			ESP_LOGI(TAG, "disconnect during pause, advertising deferred to resume");
 		return 0;
+	}
 
 	case BLE_GAP_EVENT_SUBSCRIBE:
 		if (event->subscribe.attr_handle == tx_handle) {
 			tx_subscribed = event->subscribe.cur_notify;
-			ESP_LOGI(TAG, "tx CCCD: notify %d->%d, indicate %d->%d (handle %u)",
-			         event->subscribe.prev_notify, event->subscribe.cur_notify,
-			         event->subscribe.prev_indicate, event->subscribe.cur_indicate,
+			ESP_LOGI(TAG, "tx CCCD: notify %d->%d (conn %u)",
+			         event->subscribe.prev_notify,
+			         event->subscribe.cur_notify,
 			         event->subscribe.conn_handle);
 		}
 		return 0;
@@ -286,74 +378,89 @@ static int gap_event_cb( struct ble_gap_event *event, void *arg ) {
 			ESP_LOGW(TAG, "enc_change: conn_find failed");
 			return 0;
 		}
-		ESP_LOGI(TAG, "enc_change: enc=%d auth=%d bond=%d key_sz=%u (status=%d)",
+		ESP_LOGI(TAG, "enc_change: enc=%d auth=%d bond=%d (status=%d)",
 		         desc.sec_state.encrypted, desc.sec_state.authenticated,
-		         desc.sec_state.bonded, desc.sec_state.key_size,
-		         event->enc_change.status);
-		if (desc.sec_state.encrypted && desc.sec_state.authenticated) {
+		         desc.sec_state.bonded, event->enc_change.status);
+		if (desc.sec_state.encrypted) {
+			conn_encrypted = true;
 			ble_state = BLE_STATE_CONNECTED;
-			allow_pairing = false;
+			allow_pairing = false; /* pairing accomplished */
 
-			/* Now that encryption is established, it is safe to nudge the
-			 * controller: prefer 2M PHY for throughput and tighten the
-			 * connection interval. Doing this here (rather than at CONNECT)
-			 * avoids racing SMP -- the historical cause of post-pairing
-			 * disconnects on Android. */
-			int rc_phy = ble_gap_set_prefered_le_phy(event->enc_change.conn_handle,
+			/* First LL procedure after encryption: tighten the connection
+			 * interval (40..80 ms, legal per supervision formula and Apple
+			 * QA1931). The 2M PHY request is deferred until CONN_UPDATE
+			 * completes so the two procedures never overlap. */
+			struct ble_gap_upd_params up = {
+				.itvl_min = 32,            /* 40 ms */
+				.itvl_max = 64,            /* 80 ms */
+				.latency = 0,
+				.supervision_timeout = 300,/* 3 s  (> 2 * 80 ms: legal) */
+			};
+			int rc = ble_gap_update_params(event->enc_change.conn_handle, &up);
+			ESP_LOGI(TAG, "param update req: rc=%d", rc);
+		} else {
+			/* Encryption restore failed. With correct ID-key distribution
+			 * this should not happen; if the peer lost its bond it will
+			 * re-pair (Just Works, accepted) and recover automatically. */
+			ESP_LOGW(TAG, "enc_change: encryption NOT established");
+		}
+		return 0;
+
+	case BLE_GAP_EVENT_CONN_UPDATE:
+		if (ble_gap_conn_find(event->conn_update.conn_handle, &desc) != 0)
+			return 0;
+		ESP_LOGI(TAG, "conn update: itvl=%u us latency=%u superv=%u ms (status=%d)",
+		         desc.conn_itvl * 1250, desc.conn_latency,
+		         desc.supervision_timeout * 10, event->conn_update.status);
+		/* Param update finished -> now (and only now) request the 2M PHY.
+		 * One LL procedure at a time. Failures are harmless (1M PHY works
+		 * fine) and are only logged. */
+		if (conn_encrypted && active_conn != BLE_HS_CONN_HANDLE_NONE) {
+			int rc = ble_gap_set_prefered_le_phy(active_conn,
 				BLE_GAP_LE_PHY_2M_MASK, BLE_GAP_LE_PHY_2M_MASK,
 				BLE_GAP_LE_PHY_CODED_ANY);
-			ESP_LOGI(TAG, "phy update req: rc=%d", rc_phy);
-
-			struct ble_gap_upd_params up = {
-				/* 40..80 ms interval: responsive enough for a Reticulum/BLE
-				 * bridge, much lower duty cycle than the 7.5..15 ms default.
-				 * supervision 4 s (320*10ms) -- tolerate brief RF gaps. */
-				.itvl_min = 32,
-				.itvl_max = 64,
-				.latency = 0,
-				.supervision_timeout = 320,
-			};
-			int rc_upd = ble_gap_update_params(event->enc_change.conn_handle, &up);
-			ESP_LOGI(TAG, "param update req: rc=%d", rc_upd);
-		} else {
-			ESP_LOGW(TAG, "enc_change: encryption incomplete (enc=%d auth=%d)",
-			         desc.sec_state.encrypted, desc.sec_state.authenticated);
+			ESP_LOGI(TAG, "phy 2M req: rc=%d", rc);
 		}
+		return 0;
+
+	case BLE_GAP_EVENT_PHY_UPDATE_COMPLETE:
+		ESP_LOGI(TAG, "phy update: tx=%d rx=%d (status=%d)",
+		         event->phy_updated.tx_phy, event->phy_updated.rx_phy,
+		         event->phy_updated.status);
 		return 0;
 
 	case BLE_GAP_EVENT_PASSKEY_ACTION:
-		if (!allow_pairing) {
-			ESP_LOGW(TAG, "pairing rejected (not in pairing mode)");
-			ble_gap_terminate(event->passkey.conn_handle,
-			                  BLE_ERR_NO_PAIRING);
-			return 0;
-		}
-		if (event->passkey.params.action == BLE_SM_IOACT_DISP) {
-			struct ble_sm_io pk = { 0 };
-			pk.action = BLE_SM_IOACT_DISP;
-			pk.passkey = BLE_PASSKEY;
-			ESP_LOGI(TAG, "passkey: %06lu", (unsigned long)BLE_PASSKEY);
-			ble_sm_inject_io(event->passkey.conn_handle, &pk);
-		}
+		/* Should never fire: IO cap is NoInputNoOutput (Just Works). Kept
+		 * as a defensive log; do NOT terminate the link here -- a
+		 * terminate during SMP makes Android delete its bond. */
+		ESP_LOGW(TAG, "unexpected passkey action %d (just-works device)",
+		         event->passkey.params.action);
 		return 0;
 
 	case BLE_GAP_EVENT_REPEAT_PAIRING: {
+		/* Peer is bonded on our side but initiated pairing again (e.g. it
+		 * lost or rotated its keys). Standard NimBLE recovery: drop our
+		 * stale bond and let the new pairing proceed. The resolving-list
+		 * entry must be cleared first -- see the note on
+		 * ble_hs_pvcy_remove_entry above (IDF 5.4.4 lacks the upstream
+		 * remove-before-add fix; re-adding an existing identity fails
+		 * with HCI 0x212 and kills the pairing). */
 		int rc = ble_gap_conn_find(event->repeat_pairing.conn_handle, &desc);
-		if (rc == 0)
+		if (rc == 0) {
+			ble_hs_pvcy_remove_entry(desc.peer_id_addr.type,
+			                         desc.peer_id_addr.val);
 			ble_store_util_delete_peer(&desc.peer_id_addr);
+			ESP_LOGI(TAG, "repeat pairing: stale bond cleared, retrying");
+		}
 		return BLE_GAP_REPEAT_PAIRING_RETRY;
 	}
 
 	case BLE_GAP_EVENT_ADV_COMPLETE:
 		/* Don't auto-restart while paused: ble_pause() explicitly stopped
-		 * advertising and the ADV_COMPLETE it generated must not undo that.
-		 * ble_resume() restarts advertising when the scan finishes. */
-		if (s_ble_paused)
+		 * advertising and the ADV_COMPLETE it generated must not undo
+		 * that; ble_resume() restarts when the scan finishes. */
+		if (s_ble_pause_depth > 0)
 			return 0;
-		/* Fast burst window expired (duration ran out). Drop to slow
-		 * advertising for power saving and restart. If we were already
-		 * in slow mode this means advertising was stopped externally --
-		 * just stay slow and restart. */
 		if (s_adv_fast) {
 			s_adv_fast = false;
 			ESP_LOGI(TAG, "fast window expired, switching to slow");
@@ -402,13 +509,22 @@ static void on_sync( void ) {
 	ble_svc_gap_device_name_set(s_device_name);
 	ESP_LOGI(TAG, "device name: %s", s_device_name);
 
+	int bonds = 0;
+	ble_store_util_count(BLE_STORE_OBJ_TYPE_PEER_SEC, &bonds);
+	ESP_LOGI(TAG, "bonded peers restored from NVS: %d", bonds);
+
 	if (ble_state == BLE_STATE_OFF)
 		ble_state = BLE_STATE_ON;
 	ble_advertise();
 }
 
 static void on_reset( int reason ) {
-	ESP_LOGW(TAG, "nimble reset: %d", reason);
+	ESP_LOGW(TAG, "nimble host reset: %d -> resynchronising", reason);
+	/* The host will re-sync (on_sync) and re-advertise; make sure no stale
+	 * connection state survives the reset. */
+	active_conn = BLE_HS_CONN_HANDLE_NONE;
+	conn_encrypted = false;
+	tx_subscribed = false;
 }
 
 static void host_task( void *param ) {
@@ -426,7 +542,7 @@ static void flush_task( void *arg ) {
 	vTaskDelay(pdMS_TO_TICKS(3000));
 	for (;;) {
 		ble_flush();
-		vTaskDelay(pdMS_TO_TICKS(STATUS_TASK_MS));
+		vTaskDelay(pdMS_TO_TICKS(FLUSH_PERIOD_MS));
 	}
 }
 
@@ -452,20 +568,26 @@ void ble_init( void ) {
 
 	ble_hs_cfg.reset_cb          = on_reset;
 	ble_hs_cfg.sync_cb           = on_sync;
-	ble_hs_cfg.gatts_register_cb = NULL;
 	ble_hs_cfg.store_status_cb   = ble_store_util_status_rr;
 
-	ble_hs_cfg.sm_io_cap         = BLE_SM_IO_CAP_DISP_ONLY;
+	/* --- Security: Just Works + Bonding + Secure Connections ----------
+	 * NoInputNoOutput with sm_mitm=0 => Just Works association model:
+	 * pairs silently on every platform (columba auto-confirms consent
+	 * pairing; `bluetoothctl pair` needs no agent for python RNS). The
+	 * link is still encrypted and the data plane rejects unencrypted
+	 * access (see gatt_access_cb / ble_flush). A static public passkey
+	 * provided no real MITM protection, so nothing is lost -- see
+	 * docs/ble-analysis.md section 4. */
+	ble_hs_cfg.sm_io_cap         = BLE_SM_IO_CAP_NO_IO;
 	ble_hs_cfg.sm_bonding        = 1;
-	ble_hs_cfg.sm_mitm           = 1;
+	ble_hs_cfg.sm_mitm           = 0;
 	ble_hs_cfg.sm_sc             = 1;
-	/* Distribute only the LTK (encryption key). We do NOT distribute the ID
-	 * key (IRK) because this device uses a static address (no RPA privacy),
-	 * so the controller has no resolving list to populate. Sending IRK
-	 * anyway caused "hci_err=0x212 LE Add Device To Resolving List" spam
-	 * on every bond. LTK is enough for reconnection without re-pairing. */
-	ble_hs_cfg.sm_our_key_dist   = BLE_SM_PAIR_KEY_DIST_ENC;
-	ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC;
+	/* ID keys (IRK + identity address) MUST be exchanged both ways, or the
+	 * bond is keyed on the peer's RPA and dies at the first RPA rotation /
+	 * reboot -- the root cause of "pairing does not survive reboot" (SC
+	 * strips the ENC bit, so an ENC-only mask distributes nothing at all). */
+	ble_hs_cfg.sm_our_key_dist   = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
+	ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
 
 	rc = gatt_svr_init();
 	if (rc != 0) {
@@ -488,14 +610,13 @@ void ble_enable_pairing( void ) {
 	allow_pairing = true;
 	if (ble_state == BLE_STATE_OFF || ble_state == BLE_STATE_ON)
 		ble_state = BLE_STATE_PAIRING;
-	ESP_LOGI(TAG, "pairing enabled (passkey: %06lu)",
-	         (unsigned long)BLE_PASSKEY);
+	ESP_LOGI(TAG, "pairing window open (just-works, advertising boosted)");
 
 	/* Re-arm the fast discovery window so the user (who just pressed the
-	 * pairing button) can actually find the device in Bluetooth settings
-	 * within ~1 s, regardless of how long ago the last fast burst expired.
-	 * Restarting advertising while it is already running is allowed; the
-	 * in-flight instance is replaced. */
+	 * pairing button) can find the device within ~1 s regardless of how
+	 * long ago the last fast burst expired. Restarting advertising while
+	 * it is already running is allowed; the in-flight instance is
+	 * replaced. */
 	s_adv_fast = true;
 	if (ble_hs_synced()) {
 		ble_gap_adv_stop();
@@ -507,15 +628,11 @@ void ble_disable_pairing( void ) {
 	allow_pairing = false;
 	if (ble_state == BLE_STATE_PAIRING)
 		ble_state = BLE_STATE_ON;
-	ESP_LOGI(TAG, "pairing disabled");
+	ESP_LOGI(TAG, "pairing window closed");
 }
 
 ble_state_t ble_get_state( void ) {
 	return ble_state;
-}
-
-uint32_t ble_get_passkey( void ) {
-	return BLE_PASSKEY;
 }
 
 bool ble_connected( void ) {
@@ -538,15 +655,29 @@ size_t ble_read_bytes( uint8_t *buf, size_t len ) {
 }
 
 size_t ble_write( const uint8_t *buf, size_t len ) {
-	if (!tx_subscribed || active_conn == BLE_HS_CONN_HANDLE_NONE)
+	/* Frame-atomic: either the whole frame fits or the whole frame is
+	 * dropped. Callers hand us complete KISS frames; a silent mid-frame
+	 * splice would corrupt the client's KISS parser (KISS has no CRC). */
+	if (tx_mutex == NULL)
 		return 0;
 
-	xSemaphoreTake(tx_mutex, portMAX_DELAY);
-	for (size_t i = 0; i < len; i++) {
-		tx_buf[tx_buf_len++] = buf[i];
-		if (tx_buf_len >= TX_BUFFER_SIZE)
-			break;
+	if (!tx_subscribed || !conn_encrypted ||
+	    active_conn == BLE_HS_CONN_HANDLE_NONE) {
+		s_tx_drop_nosub += len;
+		return 0;
 	}
+
+	xSemaphoreTake(tx_mutex, portMAX_DELAY);
+	if (len > TX_BUFFER_SIZE - tx_buf_len) {
+		s_tx_frames_dropped++;
+		ESP_LOGW(TAG, "tx buffer full: frame dropped (%u/%u used, total dropped %lu)",
+		         (unsigned)tx_buf_len, TX_BUFFER_SIZE,
+		         (unsigned long)s_tx_frames_dropped);
+		xSemaphoreGive(tx_mutex);
+		return 0;
+	}
+	memcpy(tx_buf + tx_buf_len, buf, len);
+	tx_buf_len += len;
 	xSemaphoreGive(tx_mutex);
 	return len;
 }
@@ -554,9 +685,9 @@ size_t ble_write( const uint8_t *buf, size_t len ) {
 void ble_pause(void) {
 	if (!thalow_config_get_ble_enabled())
 		return;
-	if (s_ble_paused)
+	s_ble_pause_depth++;
+	if (s_ble_pause_depth > 1)
 		return;
-	s_ble_paused = true;
 	/* Stop advertising but keep the BT controller + NimBLE host task alive.
 	 * Calling esp_bt_controller_disable() while the host task is running races
 	 * HCI traffic into a torn-down VHCI transport -> xQueueGenericSend(NULL)
@@ -570,9 +701,11 @@ void ble_pause(void) {
 }
 
 void ble_resume(void) {
-	if (!s_ble_paused)
+	if (s_ble_pause_depth == 0)
 		return;
-	s_ble_paused = false;
+	s_ble_pause_depth--;
+	if (s_ble_pause_depth > 0)
+		return;
 	/* Restart advertising only if not currently connected. While connected the
 	 * peripheral can't advertise; the DISCONNECT handler restarts it when the
 	 * link drops. Re-arm fast mode so we're rediscoverable quickly post-scan. */
@@ -587,16 +720,17 @@ void ble_flush( void ) {
 	/* When BLE is disabled in config, ble_init() never runs and tx_mutex is
 	 * never created (it stays NULL). xSemaphoreTake(NULL, ...) asserts and
 	 * panics. The on_rns_frame -> kiss_send_data -> on_kiss_tx -> ble_flush
-	 * path is still wired even with BLE off (so an incoming RF packet still
-	 * reaches this code), so we must bail out before touching the mutex.
-	 * The !tx_subscribed early-return below would also fire, but only AFTER
-	 * the take -- which is exactly where the crash happens. */
+	 * path is still wired even with BLE off, so we must bail out before
+	 * touching the mutex. */
 	if (!thalow_config_get_ble_enabled())
+		return;
+	if (tx_mutex == NULL)
 		return;
 
 	xSemaphoreTake(tx_mutex, portMAX_DELAY);
 
-	if (!tx_subscribed || active_conn == BLE_HS_CONN_HANDLE_NONE) {
+	if (!tx_subscribed || !conn_encrypted ||
+	    active_conn == BLE_HS_CONN_HANDLE_NONE) {
 		tx_buf_len = 0;
 		xSemaphoreGive(tx_mutex);
 		return;
@@ -611,10 +745,14 @@ void ble_flush( void ) {
 		size_t chunk = (tx_buf_len > max_chunk) ? max_chunk : tx_buf_len;
 		struct os_mbuf *om = ble_hs_mbuf_from_flat(tx_buf, chunk);
 		if (om == NULL)
-			break;
+			break; /* mbuf pool exhausted; retry next flush tick */
 		int rc = ble_gatts_notify_custom(active_conn, tx_handle, om);
-		if (rc != 0)
+		if (rc != 0) {
+			if (++s_notify_fail % 100 == 1)
+				ESP_LOGW(TAG, "notify rc=%d (queue busy?), failures %lu",
+				         rc, (unsigned long)s_notify_fail);
 			break;
+		}
 		tx_buf_len -= chunk;
 		if (tx_buf_len > 0)
 			memmove(tx_buf, tx_buf + chunk, tx_buf_len);

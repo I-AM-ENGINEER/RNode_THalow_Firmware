@@ -20,7 +20,6 @@ void ble_enable_pairing( void );
 void ble_disable_pairing( void );
 
 ble_state_t ble_get_state( void );
-uint32_t ble_get_passkey( void );
 bool ble_connected( void );
 
 /* Temporarily disable/enable the BLE controller (e.g. to free the radio for

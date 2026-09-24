@@ -21,7 +21,7 @@ The ESP32 acts as a transparent bridge.
 ### Features
 
 - Transparent BLE <-> HaLow radio bridge
-- Secure BLE pairing (passkey, bonding)
+- Encrypted BLE link: Just Works pairing + bonding (NVS-persisted, survives reboots)
 
 ### Hardware
 
@@ -48,13 +48,20 @@ one-time step done before flashing the ESP32-S3.
 ### Pairing
 
 1. Make sure the device is powered on.
-2. Press and hold the BOOT button for 3 seconds.
-3. The LED starts blinking fast — the device is in pairing mode for 35 seconds.
-4. Connect from your phone/PC; the device advertises as `RNode HaLow XXYYZZ`
+2. Optionally press and hold the BOOT button for 3 seconds — this opens a
+   35-second pairing window (fast advertising + fast LED blink) so the device
+   is discoverable within ~1 second.
+3. Connect from your phone/PC; the device advertises as `RNode HaLow XXYYZZ`
    (last 3 bytes of the MAC address).
-5. Enter passkey `123456` when prompted.
+4. No passkey is needed: pairing is Just Works (confirmed silently by
+   Columba, `bluetoothctl`, and the system Bluetooth dialogs).
 
-After pairing, the bond is saved and reconnection is automatic.
+The link is encrypted and the bond is stored in NVS on both sides;
+reconnection after any reboot is automatic, without re-pairing.
+
+For python Reticulum (RNodeInterface over BLE), pair once on the host
+(`bluetoothctl pair <MAC>`, no agent interaction needed) and use
+`port = ble://` or `port = ble://RNode HaLow XXYYZZ` in the interface config.
 
 ### Connecting
 
@@ -144,7 +151,7 @@ ESP32 работает как прозрачный мост.
 ### Возможности
 
 - Прозрачный мост BLE <-> радиомодуль HaLow
-- Безопасное BLE-сопряжение (passkey, bonding)
+- Шифрованный BLE-канал: пейринг Just Works + бондинг (бонды в NVS, переживают перезагрузки)
 
 ### Аппаратная часть
 
@@ -171,13 +178,20 @@ ESP32 работает как прозрачный мост.
 ### Сопряжение
 
 1. Убедитесь, что устройство включено.
-2. Нажмите и удерживайте кнопку BOOT 3 секунды.
-3. Светодиод начинает быстро мигать — устройство в режиме сопряжения 35 секунд.
-4. Подключитесь с телефона/ПК; устройство называется `RNode HaLow XXYYZZ`
+2. При желании нажмите и удерживайте кнопку BOOT 3 секунды — откроется
+   35-секундное окно сопряжения (быстрая реклама + быстрое мигание LED),
+   устройство находится за ~1 секунду.
+3. Подключитесь с телефона/ПК; устройство называется `RNode HaLow XXYYZZ`
    (последние 3 байта MAC-адреса).
-5. Введите passkey `123456` при запросе.
+4. Passkey не нужен: пейринг Just Works (Columba, `bluetoothctl` и системные
+   диалоги подтверждают его автоматически).
 
-После сопряжения связь сохраняется, переподключение происходит автоматически.
+Канал шифруется, бонд сохраняется в NVS на обеих сторонах; после любой
+перезагрузки переподключение автоматическое, без повторного пейринга.
+
+Для python Reticulum (RNodeInterface через BLE) один раз спейрите хост
+(`bluetoothctl pair <MAC>`, агент не нужен) и используйте
+`port = ble://` или `port = ble://RNode HaLow XXYYZZ` в конфиге интерфейса.
 
 ### Подключение
 Устройство предоставляет BLE KISS-интерфейс. Используйте любой
