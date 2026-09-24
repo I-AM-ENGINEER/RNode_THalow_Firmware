@@ -163,6 +163,28 @@ static void ble_whitelist_refresh( void ) {
 	ESP_LOGI(TAG, "pairing gate: whitelist = %d bonded peer(s)", count);
 }
 
+/* Single-bond policy: the owner requires that only ONE peer may be bonded
+ * at a time. When a peer successfully pairs/encrypts, every OTHER bond is
+ * removed (store + controller resolving list); the evicted device then
+ * drops out of the whitelist and cannot even connect anymore until it
+ * pairs again through a fresh pairing window. */
+static void purge_other_bonds( const ble_addr_t *keep ) {
+	ble_addr_t ids[8];
+	int count = 0;
+
+	if (ble_store_util_bonded_peers(ids, &count,
+	                                (int)(sizeof(ids) / sizeof(ids[0]))) != 0)
+		return;
+
+	for (int i = 0; i < count; i++) {
+		if (keep != NULL && ble_addr_cmp(&ids[i], keep) == 0)
+			continue;
+		ble_hs_pvcy_remove_entry(ids[i].type, ids[i].val);
+		ble_store_util_delete_peer(&ids[i]);
+		ESP_LOGI(TAG, "single-bond policy: evicted previous peer");
+	}
+}
+
 /* ------------------------------------------------------------------ */
 /* GATT                                                               */
 /* ------------------------------------------------------------------ */
@@ -351,11 +373,15 @@ static void ble_advertise( void ) {
 /* ------------------------------------------------------------------ */
 
 static const char *hci_reason_str( int reason ) {
+	/* NimBLE wraps controller/HW errors with BLE_HS_ERR_HW_BASE (0x200):
+	 * e.g. 531 == 0x213 == HW base + HCI 0x13 (peer closed). */
+	if (reason >= 0x200)
+		reason &= 0xFF;
 	switch (reason) {
 	case 0x08: return "conn timeout (supervision)";
-	case 0x0d: return "peer closed cleanly";
-	case 0x13: return "peer low resources";
-	case 0x14: return "peer power off";
+	case 0x13: return "peer closed cleanly";
+	case 0x14: return "peer low resources";
+	case 0x15: return "peer power off";
 	case 0x16: return "local host terminated";
 	case 0x3e: return "conn fail to establish";
 	default:   return "other";
@@ -430,6 +456,9 @@ static int gap_event_cb( struct ble_gap_event *event, void *arg ) {
 			ble_state = BLE_STATE_CONNECTED;
 			allow_pairing = false; /* pairing accomplished */
 
+			/* One bonded peer at a time: evict everyone else now. */
+			purge_other_bonds(&desc.peer_id_addr);
+
 			/* First LL procedure after encryption: tighten the connection
 			 * interval (40..80 ms, legal per supervision formula and Apple
 			 * QA1931). The 2M PHY request is deferred until CONN_UPDATE
@@ -485,13 +514,24 @@ static int gap_event_cb( struct ble_gap_event *event, void *arg ) {
 		return 0;
 
 	case BLE_GAP_EVENT_REPEAT_PAIRING: {
-		/* Peer is bonded on our side but initiated pairing again (e.g. it
-		 * lost or rotated its keys). Standard NimBLE recovery: drop our
-		 * stale bond and let the new pairing proceed. The resolving-list
-		 * entry must be cleared first -- see the note on
-		 * ble_hs_pvcy_remove_entry above (IDF 5.4.4 lacks the upstream
-		 * remove-before-add fix; re-adding an existing identity fails
-		 * with HCI 0x212 and kills the pairing). */
+		/* The peer is bonded on our side but initiated pairing again
+		 * (typically: the user deleted the bond only on the peer and its
+		 * stack is re-pairing). This is still a NEW pairing attempt and
+		 * must respect the pairing window -- otherwise any device that
+		 * was ever bonded could silently re-pair at any time, defeating
+		 * the gate. Window closed: keep our bond and reject the attempt
+		 * (the peer sees "pairing failed"; no link termination, which is
+		 * what historically made Android delete its bonds). */
+		if (!allow_pairing) {
+			ESP_LOGW(TAG, "repeat pairing rejected: pairing window closed");
+			return BLE_GAP_REPEAT_PAIRING_IGNORE;
+		}
+
+		/* Window open: standard NimBLE recovery -- drop our stale bond and
+		 * let the new pairing proceed. The resolving-list entry must be
+		 * cleared first (IDF 5.4.4 lacks the upstream remove-before-add
+		 * fix; re-adding an existing identity fails with HCI 0x212 and
+		 * kills the pairing). */
 		int rc = ble_gap_conn_find(event->repeat_pairing.conn_handle, &desc);
 		if (rc == 0) {
 			ble_hs_pvcy_remove_entry(desc.peer_id_addr.type,

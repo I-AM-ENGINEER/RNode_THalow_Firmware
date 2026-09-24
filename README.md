@@ -57,9 +57,18 @@ one-time step done before flashing the ESP32-S3.
 
 Outside the pairing window the device only accepts connections from
 already-bonded peers (controller whitelist; strangers don't even get the
-device name in scan results), so it is never "always pairing". The link is
-encrypted, the bond is stored in NVS on both sides, and reconnection after
-any reboot is automatic — bonded phones reconnect without the button.
+device name in scan results), so it is never "always pairing". Re-pairing
+a device that deleted only its own bond ALSO requires the window — the
+pairing request is silently ignored otherwise.
+
+**Single bond:** only ONE peer may be bonded at a time. When a new device
+pairs successfully, all previous bonds are evicted — the previous device
+disappears from the whitelist and cannot connect anymore until it pairs
+again through a fresh pairing window.
+
+The link is encrypted, the bond is stored in NVS on both sides, and
+reconnection after any reboot is automatic — the bonded phone reconnects
+without the button.
 
 For python Reticulum (RNodeInterface over BLE), pair once on the host while
 the window is open (`bluetoothctl pair <MAC>`, no agent interaction needed)
@@ -191,9 +200,16 @@ ESP32 работает как прозрачный мост.
 Вне окна сопряжения устройство принимает подключения только от уже
 забонденных устройств (whitelist контроллера; посторонние даже не увидят
 имя устройства в результатах сканирования) — режим «всегда готов к пейрингу»
-исключён. Канал шифруется, бонд хранится в NVS на обеих сторонах; после
-любой перезагрузки забонденные телефоны переподключаются автоматически,
-без кнопки и без повторного пейринга.
+исключён. Повторный пейринг устройства, удалившего бонд только у себя,
+ТАКЖЕ требует окна — запрос пейринга молча игнорируется.
+
+**Единый бонд:** единовременно забондено только ОДНО устройство. При
+успешном пейринге нового устройства все прежние бонды удаляются — прежнее
+устройство выпадает из whitelist и больше не может подключиться, пока не
+спейрится заново через новое окно.
+
+Канал шифруется, бонд хранится в NVS на обеих сторонах; после любой
+перезагрузки забонденный телефон переподключается автоматически, без кнопки.
 
 Для python Reticulum (RNodeInterface через BLE) один раз спейрите хост,
 пока окно открыто (`bluetoothctl pair <MAC>`, агент не нужен), и используйте
