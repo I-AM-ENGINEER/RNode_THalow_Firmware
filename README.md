@@ -51,9 +51,7 @@ one-time step done before flashing the ESP32-S3.
 2. Press and hold the BOOT button for 3 seconds — this opens a 35-second
    pairing window (fast advertising + fast LED blink).
 3. Connect from your phone/PC; the device advertises as `RNode HaLow XXYYZZ`
-   (last 3 bytes of the MAC address). Pairing is Just Works — no code entry,
-   confirmed silently by Columba, `bluetoothctl`, and the system Bluetooth
-   dialogs.
+   (last 3 bytes of the MAC address).
 
 Outside the pairing window the device only accepts connections from
 already-bonded peers (controller whitelist; strangers don't even get the
@@ -193,8 +191,7 @@ ESP32 работает как прозрачный мост.
 2. Нажмите и удерживайте кнопку BOOT 3 секунды — откроется 35-секундное
    окно сопряжения (быстрая реклама + быстрое мигание LED).
 3. Подключитесь с телефона/ПК; устройство называется `RNode HaLow XXYYZZ`
-   (последние 3 байта MAC-адреса). Пейринг Just Works — без ввода кода,
-   Columba, `bluetoothctl` и системные диалоги подтверждают его автоматически.
+   (последние 3 байта MAC-адреса).
 
 Вне окна сопряжения устройство принимает подключения только от уже
 забонденных устройств (whitelist контроллера; посторонние даже не увидят
