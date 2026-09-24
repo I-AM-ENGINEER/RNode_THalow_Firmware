@@ -278,6 +278,10 @@ void system_run( void *arg ) {
 	web_proxy_init();
 	rns_proxy_init();
 
+	/* Battery indication cadence, matching official RNode firmware
+	 * (Power.h pushes kiss_indicate_battery() every 5 s, unsolicited). */
+	uint32_t battery_last_push = 0;
+
 	for (;;) {
 		uint32_t now = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
 
@@ -288,6 +292,13 @@ void system_run( void *arg ) {
 				ble_disable_pairing();
 				pairing_active = false;
 			}
+		}
+
+		if ((now - battery_last_push) >= 5000) {
+			battery_last_push = now;
+			kiss_send_battery(&kiss, battery_get_state(),
+			                  battery_get_percent(),
+			                  battery_get_voltage_mv());
 		}
 
 		vTaskDelay(pdMS_TO_TICKS(1000));

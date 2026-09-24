@@ -14,6 +14,14 @@ static const char *TAG = "battery";
 #define BATTERY_TASK_STACK (4096)
 #define BATTERY_EMA_ALPHA  (0.2f)
 #define BATTERY_ADC_VREF_MV (3300)
+/* Status line cadence: every N filter updates (3 s each) -> ~1/minute. */
+#define BATTERY_LOG_EVERY   (20)
+/* Charge-state heuristic: compare the filtered voltage against a snapshot
+ * taken BATTERY_TREND_EVERY updates ago (60 s). No charge IC on this board,
+ * same approach as official RNode (voltage trend). */
+#define BATTERY_TREND_EVERY (20)
+#define BATTERY_TREND_MV    (15)   /* >= this rise in 60 s means charging */
+#define BATTERY_FULL_MV     (4180) /* charger termination region */
 
 static adc_oneshot_unit_handle_t s_adc_handle = NULL;
 static adc_cali_handle_t s_cali_handle = NULL;
@@ -22,7 +30,10 @@ static int s_filt_mv = 0;
 static bool s_filt_ready = false;
 static bool s_connected = false;
 static uint8_t s_percent = 0;
+static uint8_t s_state = BATTERY_STATE_UNKNOWN;
 static int s_voltage_mv = 0;
+static int s_snapshot_mv = 0;
+static int s_snapshot_count = 0;
 static bool s_task_created = false;
 
 static const struct { float v; int p; } CURVE[] = {
@@ -55,6 +66,7 @@ static int liion_voltage_to_percent(float vbat_v) {
 
 static void battery_task(void *arg) {
 	(void)arg;
+	int since_log = BATTERY_LOG_EVERY;
 
 	vTaskDelay(pdMS_TO_TICKS(BATTERY_SAMPLE_MS));
 
@@ -102,6 +114,38 @@ static void battery_task(void *arg) {
 		s_voltage_mv = s_filt_mv;
 		s_percent = (uint8_t)liion_voltage_to_percent(
 					s_filt_mv / 1000.0f);
+
+		/* Charge state: no battery -> UNKNOWN (hides the battery line
+		 * in Sideband/rnstatus); otherwise follow the voltage trend. */
+		if (!connected) {
+			s_state = BATTERY_STATE_UNKNOWN;
+			s_snapshot_count = 0;
+		} else {
+			if (s_state == BATTERY_STATE_UNKNOWN)
+				s_state = BATTERY_STATE_DISCHARGING;
+			if (++s_snapshot_count >= BATTERY_TREND_EVERY) {
+				s_snapshot_count = 0;
+				int delta_mv = s_filt_mv - s_snapshot_mv;
+				if (s_filt_mv >= BATTERY_FULL_MV)
+					s_state = BATTERY_STATE_CHARGED;
+				else if (delta_mv >= BATTERY_TREND_MV)
+					s_state = BATTERY_STATE_CHARGING;
+				else if (delta_mv <= -BATTERY_TREND_MV)
+					s_state = BATTERY_STATE_DISCHARGING;
+				/* small drift keeps the previous state */
+				s_snapshot_mv = s_filt_mv;
+			}
+		}
+
+		/* Voltage first, approximate charge in parentheses:
+		 * "battery: 3.94 V (72%)". */
+		if (++since_log >= BATTERY_LOG_EVERY) {
+			since_log = 0;
+			ESP_LOGI(TAG, "%d.%02d V (%d%%)",
+			         s_voltage_mv / 1000,
+			         (s_voltage_mv % 1000) / 10,
+			         (int)s_percent);
+		}
 
 		vTaskDelay(pdMS_TO_TICKS(BATTERY_SAMPLE_MS));
 	}
@@ -160,4 +204,8 @@ uint8_t battery_get_percent(void) {
 
 int battery_get_voltage_mv(void) {
 	return s_voltage_mv;
+}
+
+uint8_t battery_get_state(void) {
+	return s_state;
 }

@@ -27,6 +27,7 @@
 #define CMD_FW_VERSION    0x50
 #define CMD_STAT_RX       0x21
 #define CMD_STAT_TX       0x22
+#define CMD_STAT_BAT      0x27
 #define CMD_BLINK         0x30
 
 #define DETECT_REQ        0x73
@@ -245,4 +246,30 @@ void kiss_rx_byte( kiss_t *k, uint8_t b ) {
 
 void kiss_send_data( kiss_t *k, const uint8_t *data, size_t len ) {
 	send_kiss(k, CMD_DATA, data, len);
+}
+
+void kiss_send_battery( kiss_t *k, uint8_t state, uint8_t percent,
+                        int voltage_mv ) {
+	/* Official RNode payload is [state, percent] (Framing.h CMD_STAT_BAT,
+	 * Utilities.h kiss_indicate_battery); stock RNS/Sideband read exactly
+	 * the first two payload bytes and ignore the rest. Columba's parser
+	 * (columba_rnode_interface.py CMD_STAT_BAT) instead keeps the LAST
+	 * payload byte as the percent. This frame satisfies both: percent sits
+	 * at [1] for RNS and again at the tail for Columba, with the battery
+	 * voltage in 10 mV units big-endian between them for future clients. */
+	if (percent > 100)
+		percent = 100;
+	int dv = voltage_mv / 10;
+	if (dv < 0)
+		dv = 0;
+	if (dv > 0xFFFF)
+		dv = 0xFFFF;
+	uint8_t p[5] = {
+		state,
+		percent,
+		(uint8_t)((unsigned)dv >> 8),
+		(uint8_t)((unsigned)dv & 0xFF),
+		percent,
+	};
+	send_kiss(k, CMD_STAT_BAT, p, sizeof(p));
 }

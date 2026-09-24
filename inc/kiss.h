@@ -47,6 +47,12 @@ void kiss_rx_byte( kiss_t *k, uint8_t b );
 /* Send a data frame through the bound TX transport. */
 void kiss_send_data( kiss_t *k, const uint8_t *data, size_t len );
 
+/* Push a battery status frame (CMD_STAT_BAT 0x27) like official RNode
+ * firmware does every ~5 s. Payload [state, percent] is wire-compatible;
+ * two extra trailing bytes carry voltage in 10 mV units big-endian. */
+void kiss_send_battery( kiss_t *k, uint8_t state, uint8_t percent,
+                        int voltage_mv );
+
 #ifdef __cplusplus
 }
 #endif

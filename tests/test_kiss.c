@@ -20,6 +20,7 @@
 #define CMD_FW_VERSION 0x50
 #define FW_MAJOR 0x01
 #define FW_MINOR 0x59
+#define CMD_STAT_BAT 0x27
 
 static int tests_run = 0, tests_pass = 0, tests_fail = 0;
 
@@ -152,6 +153,58 @@ static void test_concurrent_scratch(void) {
 	tests_pass++; printf("OK\n");
 }
 
+static void test_battery_frame(void) {
+	/* CMD_STAT_BAT (0x27) must satisfy two client conventions at once:
+	 * stock RNS/Sideband read payload[0]=state, payload[1]=percent; Columba
+	 * keeps the LAST payload byte as percent. Voltage rides in between in
+	 * 10 mV units big-endian. Percent must clamp to 100. */
+	printf("  [TEST] KISS battery frame (RNS + Columba compatible) ... "); tests_run++;
+	kiss_t k; tx_t tx = {0};
+	kiss_init(&k, tx_cb, &tx);
+	kiss_send_battery(&k, 0x01, 72, 3940);
+	uint8_t want[] = {FEND, CMD_STAT_BAT, 0x01, 72, 0x01, 0x8A, 72, FEND};
+	if (tx.count != 1 || tx.len != sizeof(want) || memcmp(tx.data, want, sizeof(want)) != 0) {
+		printf("FAIL (len=%zu)\n", tx.len); tests_fail++; return;
+	}
+	/* Clamp + escape: percent 150 -> 100; voltage 4750 mV -> dv 475
+	 * = 0x01DB, low byte 0xDB must be escaped as FESC TFESC. */
+	tx_t tx2 = {0};
+	kiss_init(&k, tx_cb, &tx2);
+	kiss_send_battery(&k, 0x02, 150, 4750);
+	uint8_t want2[] = {FEND, CMD_STAT_BAT, 0x02, 100, 0x01, 0xDB, 0xDD, 100, FEND};
+	if (tx2.len != sizeof(want2) || memcmp(tx2.data, want2, sizeof(want2)) != 0) {
+		printf("FAIL (len=%zu)\n", tx2.len); tests_fail++; return;
+	}
+	/* Simulate both real parsers over the wire bytes. */
+	tx_t tx3 = {0};
+	kiss_init(&k, tx_cb, &tx3);
+	kiss_send_battery(&k, 0x01, 84, 4020);
+	int escape = 0; int cmd = -1; uint8_t buf[16]; int blen = 0;
+	int rns_ok = 0, columba_bat = -1;
+	for (size_t i = 0; i < tx3.len; i++) {
+		uint8_t b = tx3.data[i];
+		if (b == FEND) { cmd = -1; blen = 0; escape = 0; continue; }
+		if (cmd == -1) { cmd = b; continue; }
+		if (b == 0xDB) { escape = 1; continue; }
+		if (escape) {
+			if (b == 0xDC) b = FEND;
+			else if (b == 0xDD) b = 0xDB;
+			escape = 0;
+		}
+		if (blen < (int)sizeof(buf)) buf[blen++] = b;
+		if (cmd == CMD_STAT_BAT) {
+			/* RNS readLoop: sets state/percent exactly at payload len 2 */
+			if (blen == 2 && buf[0] == 0x01 && buf[1] == 84)
+				rns_ok = 1;
+			/* Columba: r_stat_bat = every payload byte (last one wins) */
+			columba_bat = b;
+		}
+	}
+	if (!rns_ok) { printf("FAIL (rns view)\n"); tests_fail++; return; }
+	if (columba_bat != 84) { printf("FAIL (columba view pct=%d)\n", columba_bat); tests_fail++; return; }
+	tests_pass++; printf("OK\n");
+}
+
 int main(void) {
 	printf("=== KISS framing unit tests (real src/kiss.c) ===\n");
 	test_data_roundtrip();
@@ -161,6 +214,7 @@ int main(void) {
 	test_rx_overflow_drops_whole_frame();
 	test_cmd_echo();
 	test_concurrent_scratch();
+	test_battery_frame();
 	printf("\n=== Results: %d/%d passed, %d failed ===\n",
 	       tests_pass, tests_run, tests_fail);
 	return tests_fail > 0 ? 1 : 0;
