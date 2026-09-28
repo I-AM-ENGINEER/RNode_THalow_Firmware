@@ -39,9 +39,9 @@ static bool s_task_created = false;
 /* Official RNode firmware maps the cell voltage LINEARLY between
  * BATTERY_V_MIN_MV and BATTERY_V_MAX_MV (Power.h BAT_V_MIN/BAT_V_MAX) --
  * no discharge curve. The piecewise table we shipped in v0.3.0 read
- * 3.6 V as ~10-12% while the cell still holds roughly half its charge;
- * the linear model matches both official RNode behaviour and reality
- * (3.6 V -> 43%). */
+ * 3.6 V as ~10-12% while the cell still holds roughly half its charge.
+ * Anchored to the owner's reference points: 4.10 V (charger termination)
+ * = 100%, so 3.80 V -> 68% and 3.60 V -> 47%. */
 static int liion_voltage_to_percent(int vbat_mv) {
 	if (vbat_mv <= BATTERY_V_MIN_MV)
 		return 0;
@@ -59,7 +59,6 @@ static void battery_task(void *arg) {
 
 	for (;;) {
 		int mv_acc = 0;
-		int raw_acc = 0;
 		int valid = 0;
 		int raw = 0;
 
@@ -78,7 +77,6 @@ static void battery_task(void *arg) {
 				 * them instead of averaging the droop in. */
 				if (i >= BATTERY_WARMUP) {
 					mv_acc += mv;
-					raw_acc += raw;
 					valid++;
 				}
 			}
@@ -91,8 +89,7 @@ static void battery_task(void *arg) {
 		}
 
 		int avg_mv = mv_acc / valid;
-		int avg_raw = raw_acc / valid;
-		int vbat_mv = (int)((float)avg_mv * BATTERY_DIVIDER);
+		int vbat_mv = (int)((float)avg_mv * BATTERY_DIVIDER * BATTERY_ADC_GAIN);
 
 		bool connected = (vbat_mv >= 2000);
 		if (!s_filt_ready || connected != s_connected) {

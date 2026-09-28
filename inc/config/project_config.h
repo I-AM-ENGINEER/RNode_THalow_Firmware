@@ -101,10 +101,17 @@ extern "C" {
 #define BATTERY_OVERSAMPLE   (32)
 /* Conversions discarded at the start of each burst (see battery.c). */
 #define BATTERY_WARMUP       (4)
-/* Li-ion percent model, same linear mapping as official RNode firmware
- * (Power.h BAT_V_MIN/BAT_V_MAX). 3.60 V -> 43%. */
+/* Field calibration of the whole measurement chain (divider tolerance +
+ * ~50 kOhm source droop into the ADC): a multimeter showed 3.60 V / 3.80 V
+ * on the cell while the firmware read ~3.50 V / ~3.70 V -- the same x1.028
+ * factor at both points. Verify against a multimeter after flashing and
+ * true this up if needed. */
+#define BATTERY_ADC_GAIN     (1.028f)
+/* Li-ion percent model: linear mapping like official RNode firmware
+ * (Power.h BAT_V_MIN/BAT_V_MAX), with the max anchored at 4.10 V = 100%
+ * (this charger's termination). 3.80 V -> 68%, 3.60 V -> 47%. */
 #define BATTERY_V_MIN_MV     (3150)
-#define BATTERY_V_MAX_MV     (4200)
+#define BATTERY_V_MAX_MV     (4100)
 
 /* --- Logging --- */
 #define LOG_TAG_MAIN        "rnode"
