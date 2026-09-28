@@ -38,13 +38,14 @@ static const char *TAG = "ble";
 /* ------------------------------------------------------------------ */
 /* Design notes (full analysis: docs/ble-analysis.md)                  */
 /*                                                                     */
-/* Security model: Just Works + bonding + Secure Connections. The old  */
-/* static-passkey MITM posture protected nothing (public constant      */
-/* passkey == Just Works) while breaking headless clients: python RNS   */
-/* has no pairing agent, and our terminate-during-pairing made Android */
-/* delete its bond ("device disappears from saved devices"). Data is   */
-/* still encrypted-only: RX writes return INSUFFICIENT_AUTHEN until    */
-/* the link is encrypted, notifications are withheld until encrypted.  */
+/* Security model: static passkey (BLE_PASSKEY) + bonding + Secure     */
+/* Connections. Just Works (v0.2.1..v0.3.0) paired silently but some    */
+/* vendor Android ROMs (e.g. crDroid 10.13) fail it with a bogus        */
+/* "incorrect PIN or password" error, so the fixed passkey the user     */
+/* types on the peer is restored. Caveat: headless clients (python RNS  */
+/* via bluetoothctl) now need an agent to answer the passkey prompt.    */
+/* Data is still encrypted-only: RX writes return INSUFFICIENT_AUTHEN  */
+/* until the link is encrypted, notifications withheld until encrypted. */
 /*                                                                     */
 /* Bonding: keys distributed are ENC|ID in BOTH directions. With SC the */
 /* ENC bit is stripped by NimBLE anyway; what matters is ID (IRK +      */
@@ -474,7 +475,7 @@ static int gap_event_cb( struct ble_gap_event *event, void *arg ) {
 		} else {
 			/* Encryption restore failed. With correct ID-key distribution
 			 * this should not happen; if the peer lost its bond it will
-			 * re-pair (Just Works, accepted) and recover automatically. */
+			 * re-pair (passkey, accepted in the window) and recover. */
 			ESP_LOGW(TAG, "enc_change: encryption NOT established");
 		}
 		return 0;
@@ -506,11 +507,22 @@ static int gap_event_cb( struct ble_gap_event *event, void *arg ) {
 		return 0;
 
 	case BLE_GAP_EVENT_PASSKEY_ACTION:
-		/* Should never fire: IO cap is NoInputNoOutput (Just Works). Kept
-		 * as a defensive log; do NOT terminate the link here -- a
-		 * terminate during SMP makes Android delete its bond. */
-		ESP_LOGW(TAG, "unexpected passkey action %d (just-works device)",
-		         event->passkey.params.action);
+		/* DISPLAY_ONLY + MITM => Passkey Display: answer with the fixed
+		 * BLE_PASSKEY. Outside the pairing window the key is withheld and
+		 * the pairing simply times out -- do NOT terminate the link here,
+		 * a terminate during SMP makes Android delete its bond. */
+		if (event->passkey.params.action != BLE_SM_IOACT_DISP)
+			return 0;
+		if (!allow_pairing) {
+			ESP_LOGW(TAG, "passkey withheld: pairing window closed");
+			return 0;
+		}
+		struct ble_sm_io pk = { 0 };
+		pk.action = BLE_SM_IOACT_DISP;
+		pk.passkey = BLE_PASSKEY;
+		ESP_LOGI(TAG, "pairing passkey: %06lu",
+		         (unsigned long)BLE_PASSKEY);
+		ble_sm_inject_io(event->passkey.conn_handle, &pk);
 		return 0;
 
 	case BLE_GAP_EVENT_REPEAT_PAIRING: {
@@ -658,17 +670,17 @@ void ble_init( void ) {
 	ble_hs_cfg.sync_cb           = on_sync;
 	ble_hs_cfg.store_status_cb   = ble_store_util_status_rr;
 
-	/* --- Security: Just Works + Bonding + Secure Connections ----------
-	 * NoInputNoOutput with sm_mitm=0 => Just Works association model:
-	 * pairs silently on every platform (columba auto-confirms consent
-	 * pairing; `bluetoothctl pair` needs no agent for python RNS). The
-	 * link is still encrypted and the data plane rejects unencrypted
-	 * access (see gatt_access_cb / ble_flush). A static public passkey
-	 * provided no real MITM protection, so nothing is lost -- see
-	 * docs/ble-analysis.md section 4. */
-	ble_hs_cfg.sm_io_cap         = BLE_SM_IO_CAP_NO_IO;
+	/* --- Security: static passkey + Bonding + Secure Connections ------
+	 * DISPLAY_ONLY with sm_mitm=1 => Passkey Display association model:
+	 * the peer must type BLE_PASSKEY (the device "displays" it by
+	 * convention -- it is printed to the console). Just Works
+	 * (v0.2.1..v0.3.0) failed on some vendor Android ROMs with a bogus
+	 * "incorrect PIN" error, so the fixed passkey is restored per field
+	 * reports. The link is still SC-encrypted and the data plane rejects
+	 * unencrypted access (see gatt_access_cb / ble_flush). */
+	ble_hs_cfg.sm_io_cap         = BLE_SM_IO_CAP_DISP_ONLY;
 	ble_hs_cfg.sm_bonding        = 1;
-	ble_hs_cfg.sm_mitm           = 0;
+	ble_hs_cfg.sm_mitm           = 1;
 	ble_hs_cfg.sm_sc             = 1;
 	/* ID keys (IRK + identity address) MUST be exchanged both ways, or the
 	 * bond is keyed on the peer's RPA and dies at the first RPA rotation /
@@ -698,7 +710,8 @@ void ble_enable_pairing( void ) {
 	allow_pairing = true;
 	if (ble_state == BLE_STATE_OFF || ble_state == BLE_STATE_ON)
 		ble_state = BLE_STATE_PAIRING;
-	ESP_LOGI(TAG, "pairing window open (just-works, advertising boosted)");
+	ESP_LOGI(TAG, "pairing window open (passkey %06lu, advertising boosted)",
+	         (unsigned long)BLE_PASSKEY);
 
 	/* Re-arm the fast discovery window so the user (who just pressed the
 	 * pairing button) can find the device within ~1 s regardless of how
