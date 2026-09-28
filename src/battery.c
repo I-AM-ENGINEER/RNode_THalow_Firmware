@@ -36,32 +36,19 @@ static int s_snapshot_mv = 0;
 static int s_snapshot_count = 0;
 static bool s_task_created = false;
 
-static const struct { float v; int p; } CURVE[] = {
-	{4.10f,100},{4.00f,90},{3.93f,80},{3.87f,70},{3.82f,55},
-	{3.77f,45},{3.73f,35},{3.68f,25},{3.62f,15},{3.56f,8},
-	{3.50f,4},{3.40f,1},{3.30f,0}
-};
-#define CURVE_N (sizeof(CURVE) / sizeof(CURVE[0]))
-
-static int liion_voltage_to_percent(float vbat_v) {
-	if (vbat_v >= CURVE[0].v)
-		return 100;
-	if (vbat_v <= CURVE[CURVE_N - 1].v)
+/* Official RNode firmware maps the cell voltage LINEARLY between
+ * BATTERY_V_MIN_MV and BATTERY_V_MAX_MV (Power.h BAT_V_MIN/BAT_V_MAX) --
+ * no discharge curve. The piecewise table we shipped in v0.3.0 read
+ * 3.6 V as ~10-12% while the cell still holds roughly half its charge;
+ * the linear model matches both official RNode behaviour and reality
+ * (3.6 V -> 43%). */
+static int liion_voltage_to_percent(int vbat_mv) {
+	if (vbat_mv <= BATTERY_V_MIN_MV)
 		return 0;
-
-	for (int i = 0; i < (int)(CURVE_N - 1); i++) {
-		float v0 = CURVE[i].v;
-		float v1 = CURVE[i + 1].v;
-		if (vbat_v <= v0 && vbat_v >= v1) {
-			float frac = (vbat_v - v1) / (v0 - v1);
-			int p = CURVE[i + 1].p +
-			        (int)(frac * (CURVE[i].p - CURVE[i + 1].p));
-			if (p < 0) p = 0;
-			if (p > 100) p = 100;
-			return p;
-		}
-	}
-	return 0;
+	if (vbat_mv >= BATTERY_V_MAX_MV)
+		return 100;
+	return (vbat_mv - BATTERY_V_MIN_MV) * 100 /
+	       (BATTERY_V_MAX_MV - BATTERY_V_MIN_MV);
 }
 
 static void battery_task(void *arg) {
@@ -76,7 +63,7 @@ static void battery_task(void *arg) {
 		int valid = 0;
 		int raw = 0;
 
-		for (int i = 0; i < BATTERY_OVERSAMPLE; i++) {
+		for (int i = 0; i < BATTERY_OVERSAMPLE + BATTERY_WARMUP; i++) {
 			if (adc_oneshot_read(s_adc_handle, BATTERY_ADC_CH,
 			                     &raw) == ESP_OK) {
 				int mv = 0;
@@ -85,9 +72,15 @@ static void battery_task(void *arg) {
 				} else {
 					mv = (int)((raw * BATTERY_ADC_VREF_MV) / 4095);
 				}
-				mv_acc += mv;
-				raw_acc += raw;
-				valid++;
+				/* The 100k/100k divider is a ~50 kOhm source; the
+				 * first conversions after the 3 s idle under-charge
+				 * the ADC sample-and-hold and read low. Discard
+				 * them instead of averaging the droop in. */
+				if (i >= BATTERY_WARMUP) {
+					mv_acc += mv;
+					raw_acc += raw;
+					valid++;
+				}
 			}
 			vTaskDelay(pdMS_TO_TICKS(2));
 		}
@@ -112,8 +105,7 @@ static void battery_task(void *arg) {
 		}
 
 		s_voltage_mv = s_filt_mv;
-		s_percent = (uint8_t)liion_voltage_to_percent(
-					s_filt_mv / 1000.0f);
+		s_percent = (uint8_t)liion_voltage_to_percent(s_filt_mv);
 
 		/* Charge state: no battery -> UNKNOWN (hides the battery line
 		 * in Sideband/rnstatus); otherwise follow the voltage trend. */

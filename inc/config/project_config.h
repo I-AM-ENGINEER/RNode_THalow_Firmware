@@ -49,12 +49,13 @@ extern "C" {
 #define RNS_PROXY_BUF_SZ          (1024)
 
 /* --- BLE (Nordic UART Service, NimBLE) ---
- * Security: Just Works + bonding + Secure Connections; the data plane is
- * encrypted-only (see src/ble.c and docs/ble-analysis.md). Pairing needs
- * no passkey on any platform (columba auto-confirms, bluetoothctl pairs
- * silently for python RNS). BLE_PAIRING_TIMEOUT is the UX window opened
- * by the BOOT button (fast advertising + LED); it is not a hard SMP gate. */
+ * Security: static passkey + bonding + Secure Connections. Just Works
+ * (shipped in v0.2.1..v0.3.0) fails on some vendor Android ROMs with a
+ * bogus "incorrect PIN" error, so the fixed 6-digit passkey is restored;
+ * the device "displays" it by convention (it is printed to the console
+ * and documented), the peer types it. Data plane is encrypted-only. */
 #define BLE_DEVICE_NAME      "RNode HaLow"
+#define BLE_PASSKEY          (123456)
 #define BLE_PAIRING_TIMEOUT  (35000)
 
 /* --- BLE advertising (two-phase) ---
@@ -98,6 +99,12 @@ extern "C" {
 #define BATTERY_DIVIDER      (2.0f)
 #define BATTERY_SAMPLE_MS    (3000)
 #define BATTERY_OVERSAMPLE   (32)
+/* Conversions discarded at the start of each burst (see battery.c). */
+#define BATTERY_WARMUP       (4)
+/* Li-ion percent model, same linear mapping as official RNode firmware
+ * (Power.h BAT_V_MIN/BAT_V_MAX). 3.60 V -> 43%. */
+#define BATTERY_V_MIN_MV     (3150)
+#define BATTERY_V_MAX_MV     (4200)
 
 /* --- Logging --- */
 #define LOG_TAG_MAIN        "rnode"
