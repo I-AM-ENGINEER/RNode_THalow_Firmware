@@ -109,7 +109,7 @@ static void battery_task(void *arg) {
 		}
 
 		int avg_mv = mv_acc / valid;
-		int vbat_mv = (int)((float)avg_mv * BATTERY_DIVIDER * BATTERY_ADC_GAIN);
+		int vbat_mv = (int)((float)avg_mv * BATTERY_DIVIDER);
 
 		bool connected = (vbat_mv >= 2000);
 		if (!s_filt_ready || connected != s_connected) {

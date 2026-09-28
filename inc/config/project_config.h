@@ -101,13 +101,11 @@ extern "C" {
 #define BATTERY_OVERSAMPLE   (32)
 /* Conversions discarded at the start of each burst (see battery.c). */
 #define BATTERY_WARMUP       (4)
-/* Field calibration of the whole measurement chain (divider tolerance +
- * ~50 kOhm source droop into the ADC): a multimeter showed 3.60 V / 3.80 V
- * on the cell while the firmware read ~3.50 V / ~3.70 V -- the same x1.028
- * factor at both points. Verify against a multimeter after flashing and
- * true this up if needed. The percent model itself is a piecewise 18650
- * discharge curve in src/battery.c (4.10 V = 100%). */
-#define BATTERY_ADC_GAIN     (1.028f)
+/* No per-unit calibration constant here on purpose: the divider resistor
+ * tolerance is unit-specific (this desk's board reads ~x1.028 low), so the
+ * firmware stays nominal and any unit-to-unit offset is accepted. The
+ * percent model is the piecewise 18650 curve in src/battery.c (4.10 V =
+ * 100%). */
 
 /* --- Logging --- */
 #define LOG_TAG_MAIN        "rnode"
