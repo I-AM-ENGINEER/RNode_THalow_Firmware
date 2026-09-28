@@ -21,7 +21,7 @@ static const char *TAG = "battery";
  * same approach as official RNode (voltage trend). */
 #define BATTERY_TREND_EVERY (20)
 #define BATTERY_TREND_MV    (15)   /* >= this rise in 60 s means charging */
-#define BATTERY_FULL_MV     (4180) /* charger termination region */
+#define BATTERY_FULL_MV     (4080) /* charger termination region (4.10 V) */
 
 static adc_oneshot_unit_handle_t s_adc_handle = NULL;
 static adc_cali_handle_t s_cali_handle = NULL;
@@ -36,19 +36,39 @@ static int s_snapshot_mv = 0;
 static int s_snapshot_count = 0;
 static bool s_task_created = false;
 
-/* Official RNode firmware maps the cell voltage LINEARLY between
- * BATTERY_V_MIN_MV and BATTERY_V_MAX_MV (Power.h BAT_V_MIN/BAT_V_MAX) --
- * no discharge curve. The piecewise table we shipped in v0.3.0 read
- * 3.6 V as ~10-12% while the cell still holds roughly half its charge.
- * Anchored to the owner's reference points: 4.10 V (charger termination)
- * = 100%, so 3.80 V -> 68% and 3.60 V -> 47%. */
+/* Piecewise li-ion discharge curve for a typical 18650 (NMC/LCO). NOT
+ * linear: the cell holds a long mid plateau and a sharp knee near the
+ * end. Anchored to the owner's reference points: 4.10 V (this charger's
+ * termination) = 100%; the rest of the table sits ~80 mV below a resting
+ * OCV curve because the firmware measures while the device itself draws
+ * current (voltage sags under load). 3.80 V -> ~58%, 3.60 V -> ~33%. */
+static const struct { int mv; int p; } CURVE[] = {
+	{4100,100},{4000,90},{3940,82},{3880,73},{3830,64},
+	{3790,56},{3750,49},{3710,42},{3670,36},{3630,30},
+	{3590,24},{3550,19},{3510,14},{3470,11},{3430,8},
+	{3390,5},{3340,3},{3290,1},{3200,0}
+};
+#define CURVE_N (sizeof(CURVE) / sizeof(CURVE[0]))
+
 static int liion_voltage_to_percent(int vbat_mv) {
-	if (vbat_mv <= BATTERY_V_MIN_MV)
-		return 0;
-	if (vbat_mv >= BATTERY_V_MAX_MV)
+	if (vbat_mv >= CURVE[0].mv)
 		return 100;
-	return (vbat_mv - BATTERY_V_MIN_MV) * 100 /
-	       (BATTERY_V_MAX_MV - BATTERY_V_MIN_MV);
+	if (vbat_mv <= CURVE[CURVE_N - 1].mv)
+		return 0;
+
+	for (int i = 0; i < (int)(CURVE_N - 1); i++) {
+		int mv0 = CURVE[i].mv;
+		int mv1 = CURVE[i + 1].mv;
+		if (vbat_mv <= mv0 && vbat_mv >= mv1) {
+			int frac = ((vbat_mv - mv1) * 100) / (mv0 - mv1);
+			int p = CURVE[i + 1].p +
+			        (frac * (CURVE[i].p - CURVE[i + 1].p)) / 100;
+			if (p < 0) p = 0;
+			if (p > 100) p = 100;
+			return p;
+		}
+	}
+	return 0;
 }
 
 static void battery_task(void *arg) {

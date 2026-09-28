@@ -105,13 +105,9 @@ extern "C" {
  * ~50 kOhm source droop into the ADC): a multimeter showed 3.60 V / 3.80 V
  * on the cell while the firmware read ~3.50 V / ~3.70 V -- the same x1.028
  * factor at both points. Verify against a multimeter after flashing and
- * true this up if needed. */
+ * true this up if needed. The percent model itself is a piecewise 18650
+ * discharge curve in src/battery.c (4.10 V = 100%). */
 #define BATTERY_ADC_GAIN     (1.028f)
-/* Li-ion percent model: linear mapping like official RNode firmware
- * (Power.h BAT_V_MIN/BAT_V_MAX), with the max anchored at 4.10 V = 100%
- * (this charger's termination). 3.80 V -> 68%, 3.60 V -> 47%. */
-#define BATTERY_V_MIN_MV     (3150)
-#define BATTERY_V_MAX_MV     (4100)
 
 /* --- Logging --- */
 #define LOG_TAG_MAIN        "rnode"
